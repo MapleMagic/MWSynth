@@ -1,0 +1,30 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Runtime state and caches: machine-specific, never committed.
+# credentials.json in particular holds real service passwords.
+credentials.json
+calibration_state.json
+.synthetic_mw_tc/
+*.pt
+*.npz
+data/
+cache/
+output/
+*.nc
+*.h5
+*.hdf5
+
+# Generated imagery
+*.gif
+*.png
+!docs/**/*.png
+
+.DS_Store
+.idea/
+.vscode/
+.pytest_cache/

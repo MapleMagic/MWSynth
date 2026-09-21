@@ -1,0 +1,55 @@
+# --- Core: required for every run ---------------------------------
+numpy>=1.26
+scipy>=1.12
+matplotlib>=3.8
+requests>=2.31
+PyQt6>=6.6
+
+# --- Data ingest ---------------------------------------------------
+boto3>=1.34          # GOES ABI from the NOAA public S3 buckets
+xarray>=2024.2       # NetCDF/HDF swath and grid handling
+netCDF4>=1.6
+h5netcdf>=1.3
+h5py>=3.10
+pandas>=2.2          # best-track / IBTrACS parsing
+Pillow>=10.0         # GIF export
+earthaccess>=0.10    # NASA Earthdata auth for the GES DISC archive GMI fallback
+
+# --- Optional: features degrade gracefully without these -----------
+# NEXRAD Level II radar fusion. NO LONGER USED by default: radar is a
+# display layer anyone can get from a radar app, it only ever covered
+# storms near the US coast, and those frames looked different in
+# character from every other frame. GPM DPR -- already inside the
+# TC PRIMED files being streamed, global, storm-centred and physically
+# co-located with the PMW overpasses -- is the better source if radar is
+# ever wanted as a CONSTRAINT rather than a picture.
+#
+# radar_ingest.py is retained and still works; install this only if you
+# want to turn NEXRAD fusion back on.
+# arm_pyart>=2.0
+# Satellite overpass prediction, used to prioritise which sensor to try.
+# Without these the sensor rotation is simply tried in its default order.
+sgp4>=2.23
+skyfield>=1.49
+# Land/sea mask. Without it the whole grid is treated as ocean, and land
+# in view is rendered with ocean emissivity -- which at 37/89 GHz looks
+# like heavy precipitation, right where a landfalling storm matters most.
+# Small, pure-Python, no network at runtime. Strongly recommended.
+global-land-mask>=1.0
+
+# JAXA G-Portal AMSR2 retrieval. AMSR2-NRT retired transmission after
+# 2026-08-31 and the credential entry was removed in 0.89, so this is
+# unused by the default sensor rotation; the ingest code is retained for
+# archive work and this dependency is optional.
+gportal>=0.4
+
+# --- Optional: ML correction model ---------------------------------
+# Only needed to TRAIN or APPLY the learned correction. Without torch
+# installed, ml_inference degrades to a no-op and generation proceeds on
+# the parametric backbone alone -- nothing else is affected.
+#
+# Note that a plain `pip install torch` pulls a CPU-only build on some
+# platforms. Check https://pytorch.org/get-started/locally/ for the
+# command matching your CUDA version (nvidia-smi reports the maximum your
+# driver supports) rather than assuming the default works.
+torch>=2.2
