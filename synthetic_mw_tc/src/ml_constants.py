@@ -174,6 +174,17 @@ ELEV_MEAN, ELEV_STD = 0.0, 500.0
 # Channel order. Documented explicitly because a silent reordering
 # between training and inference is exactly the class of bug that
 # produces confident nonsense rather than an error.
+# ERA5 environment channels (0.160). Constant planes, like vmax/rmw: shear
+# as east/north components (the network cannot use a raw heading, which
+# wraps at 360), mid-level RH, core SST, PAST 24 h intensity change, storm
+# motion, and an explicit present-flag. Absent environment -- every live
+# storm, since TC PRIMED is retrospective -- is all zeros with present = 0,
+# and training withholds it at random (ENV_DROPOUT_P) so the model learns
+# to work without it rather than meeting that case first at inference.
+ENV_CHANNELS = ("env_shear_u", "env_shear_v", "env_rh_mid", "env_sst",
+                "env_dv24", "env_motion_u", "env_motion_v", "env_present")
+ENV_DROPOUT_P = 0.3
+
 INPUT_CHANNEL_LAYOUT = (
     ["ir", "wv", "swir"]
     # ONLY the bands actually fetched. The layout previously spanned all
@@ -193,8 +204,16 @@ INPUT_CHANNEL_LAYOUT = (
     # keeps its index -- a mid-list insertion would silently reinterpret
     # every existing export.
     + ["flash_density"]
+    # ERA5 environment (0.160), encoded by tcprimed_env.encode_env -- the
+    # SAME function in training and inference. Appended at the END for the
+    # same reason as lightning: every earlier index is unchanged, so a
+    # checkpoint trained without these channels is still served, with a
+    # stack that simply stops before them (see ml_inference).
+    + list(ENV_CHANNELS)
 )
 MODEL_IN_CHANNELS = len(INPUT_CHANNEL_LAYOUT)
+# A pre-0.160 checkpoint's channel count: everything but the environment.
+MODEL_IN_CHANNELS_PRE_ENV = MODEL_IN_CHANNELS - len(ENV_CHANNELS)
 
 # The extra IR bands that actually occupy channels, in channel order.
 # Both ml_train and ml_inference build their stacks from THIS, not from

@@ -80,7 +80,7 @@ def _downsample(patch):
     w = patch.shape[1] // k
     return patch[:h * k, :w * k].reshape(h, k, w, k).mean(axis=(1, 3))
 
-from ml_constants import (normalize_channel, CORRECTION_ARCH, MODEL_IN_CHANNELS, ENSEMBLE_MEMBERS, DIFFUSION_SAMPLE_STEPS,
+from ml_constants import (normalize_channel, CORRECTION_ARCH, MODEL_IN_CHANNELS, MODEL_IN_CHANNELS_PRE_ENV, ENSEMBLE_MEMBERS, DIFFUSION_SAMPLE_STEPS,
                           TB_MEAN, TB_STD, VMAX_MEAN, VMAX_STD, RMW_MEAN, RMW_STD, PATCH_SIZE,
                           PATCH_BLEND_TAPER_PX, PATCH_SAMPLE_STRIDE, PATCH_FOOTPRINT_PX,
                           DIFFUSION_BASE_CHANNELS,
@@ -216,6 +216,26 @@ _ckpt_train_stats = None
 # None for checkpoints predating it. Compared against the live backbone's
 # synthetic_algorithm.VH_PHYSICS_ID -- see _check_physics_match().
 _ckpt_vh_physics_id = None
+# {band: fraction of training examples with that band real}, from the
+# checkpoint. None = pre-0.159 checkpoint: trained when no extra band was
+# ever fetched, so it has only ever seen flat planes there.
+_ckpt_extra_ir = None
+# Input channels of the loaded checkpoint; decides whether the ERA5
+# environment planes are appended (0.160).
+_ckpt_in_channels = None
+# Why the last checkpoint load failed, if it did (0.160). The loader used
+# to return None with no trace of the reason.
+_last_load_error = None
+
+
+def extra_band_trained(band: int) -> bool:
+    """Feed band `band` real data only if the loaded checkpoint was
+    trained with it real in most examples. Pre-0.159 checkpoints learned
+    these channels are always flat; real values would push them off the
+    data they were fitted to."""
+    if not _ckpt_extra_ir:
+        return False
+    return float(_ckpt_extra_ir.get(band, _ckpt_extra_ir.get(str(band), 0.0))) >= 0.5
 
 # Architecture recorded in the checkpoint ("diffusion" | "unet"). Defaults
 # to "unet" for checkpoints predating the field.
@@ -263,7 +283,7 @@ def _check_physics_match():
             f"strength to 0 in the meantime.")
 
 
-def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
+def _load_model_cached(checkpoint_path: Optional[str] = None):
     """Lazily load and cache a trained checkpoint -- loading a PyTorch
     model from disk has real overhead, not worth repeating on every
     single generate_synthetic_mw call. Cached by path, so switching
@@ -284,6 +304,12 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
     retrained checkpoints were picked up automatically; now they actually
     are.
     """
+    # Resolved at CALL time (0.160), not bound as a default argument:
+    # a bound default could never be redirected, so the test suite ran
+    # whatever real checkpoint sat on the machine.
+    if checkpoint_path is None:
+        checkpoint_path = DEFAULT_CHECKPOINT_PATH
+
     try:
         import torch
         from ml_model import MWCorrectionUNet
@@ -312,6 +338,22 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
         # would have built the wrong width and failed on the state dict
         # with a shape error rather than anything readable.
         base_channels = checkpoint.get("base_channels", DIFFUSION_BASE_CHANNELS)
+        # The WEIGHTS say how wide the network is; trust them over the
+        # metadata (0.160). Training built the diffusion model at
+        # DIFFUSION_BASE_CHANNELS (48) but saved its `base_channels`
+        # ARGUMENT (the U-Net default, 32), so every diffusion checkpoint
+        # was rebuilt here at the wrong width, load_state_dict raised, the
+        # except below returned None -- and generation ran WITHOUT the
+        # correction, silently, for every checkpoint trained that way.
+        # out_conv.weight is (4, width, k, k) in both architectures.
+        _w = next((v for k, v in checkpoint.get("model_state_dict", {}).items()
+                   if k == "out_conv.weight" or k.endswith(".out_conv.weight")
+                   or k == "_orig_mod.out_conv.weight"), None)   # torch.compile prefix
+        if _w is not None and getattr(_w, "ndim", 0) == 4:
+            base_channels = int(_w.shape[1])
+        # And the input width the checkpoint was TRAINED with: this
+        # build's layout, or the pre-environment one (0.160).
+        _built_in = int(checkpoint.get("in_channels") or MODEL_IN_CHANNELS_PRE_ENV)
 
         # Read the architecture BEFORE constructing anything. Building the
         # wrong class and then loading weights into it fails as a wall of
@@ -323,11 +365,11 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
 
         if arch == "diffusion":
             model = MWResidualDiffusion(
-                in_channels=MODEL_IN_CHANNELS, out_channels=4, base_channels=base_channels
+                in_channels=_built_in, out_channels=4, base_channels=base_channels
             ).to(device)
         else:
             model = MWCorrectionUNet(
-                in_channels=MODEL_IN_CHANNELS, out_channels=4, base_channels=base_channels
+                in_channels=_built_in, out_channels=4, base_channels=base_channels
             ).to(device)
 
         state = checkpoint["model_state_dict"]
@@ -340,7 +382,11 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
             state = {k.replace("_orig_mod.", "", 1): v for k, v in state.items()}
         model.load_state_dict(state)
         model.eval()
-    except Exception:
+    except Exception as e:
+        # Still None -- a frame without the correction is valid -- but the
+        # reason is kept and reported by apply_ml_correction (0.160).
+        global _last_load_error
+        _last_load_error = f"{type(e).__name__}: {str(e)[:300]}"
         return None, None
 
     _ckpt_arch = arch
@@ -355,7 +401,11 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
     # live right now.
     if isinstance(checkpoint, dict):
         _ck_in = checkpoint.get("in_channels")
-        if _ck_in is not None and int(_ck_in) != int(MODEL_IN_CHANNELS):
+        # A pre-0.160 checkpoint (no environment channels) is still served:
+        # those channels were appended at the END, so its stack is this
+        # build's stack minus the tail. See _ckpt_in_channels below.
+        if _ck_in is not None and int(_ck_in) not in (int(MODEL_IN_CHANNELS),
+                                                      int(MODEL_IN_CHANNELS_PRE_ENV)):
             raise RuntimeError(
                 f"checkpoint was trained with {_ck_in} input channels but this "
                 f"build uses {MODEL_IN_CHANNELS}. Retrain, or restore the "
@@ -369,6 +419,12 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
 
     _ckpt_train_stats = checkpoint.get("train_scalar_stats") if isinstance(checkpoint, dict) else None
     _ckpt_vh_physics_id = checkpoint.get("vh_physics_id") if isinstance(checkpoint, dict) else None
+    global _ckpt_extra_ir, _ckpt_in_channels
+    _ckpt_extra_ir = (checkpoint.get("extra_ir_real_fraction")
+                      if isinstance(checkpoint, dict) else None)
+    _ckpt_in_channels = (int(checkpoint.get("in_channels"))
+                         if isinstance(checkpoint, dict) and checkpoint.get("in_channels") is not None
+                         else int(MODEL_IN_CHANNELS_PRE_ENV))
     # Prefer the value MEASURED during the run that produced these
     # weights. ENSEMBLE_SPREAD_CALIBRATION was fitted to one training run
     # and is a constant; the real figure moved 1.43x -> 3.85x within a
@@ -382,6 +438,13 @@ def _load_model_cached(checkpoint_path: str = DEFAULT_CHECKPOINT_PATH):
     _model_cache["model"] = model
     _model_cache["device"] = device
     return model, device
+
+
+def _env_planes(env) -> list:
+    """ENV_CHANNELS as constant PATCH_SIZE planes, via the shared encoder."""
+    import tcprimed_env
+    return [np.full((PATCH_SIZE, PATCH_SIZE), v, dtype=np.float32)
+            for v in tcprimed_env.encode_env(env)]
 
 
 def _make_taper(patch_size: int, taper_px: int) -> np.ndarray:
@@ -440,7 +503,7 @@ def apply_ml_correction(
     storm_lon: float,
     storm_vmax_kt: float,
     storm_rmw_nm: Optional[float],
-    checkpoint_path: str = DEFAULT_CHECKPOINT_PATH,
+    checkpoint_path: Optional[str] = None,
     progress_callback=None,
     strength: Optional[float] = None,
     max_correction_k: Optional[float] = None,
@@ -451,6 +514,7 @@ def apply_ml_correction(
     elevation_m: Optional[np.ndarray] = None,
     flash_density: Optional[np.ndarray] = None,
     stats_out: Optional[dict] = None,
+    env: Optional[dict] = None,
 ) -> tuple:
     """Apply a trained correction model to the backbone V/H fields,
     within a storm-centered patch, blended back with a smooth taper.
@@ -476,6 +540,12 @@ def apply_ml_correction(
         diagnostics (see below). Kept as an out-parameter rather than an
         extra return value so existing 4-tuple callers keep working.
     """
+    # Resolved at CALL time (0.160), not bound as a default argument:
+    # a bound default could never be redirected, so the test suite ran
+    # whatever real checkpoint sat on the machine.
+    if checkpoint_path is None:
+        checkpoint_path = DEFAULT_CHECKPOINT_PATH
+
     strength = DEFAULT_CORRECTION_STRENGTH if strength is None else float(strength)
     max_correction_k = DEFAULT_MAX_CORRECTION_K if max_correction_k is None else float(max_correction_k)
     max_pct_k = DEFAULT_MAX_PCT_K if max_pct_k is None else float(max_pct_k)
@@ -487,6 +557,14 @@ def apply_ml_correction(
 
     model, device = _load_model_cached(checkpoint_path)
     if model is None:
+        reason = (_last_load_error or "no checkpoint at " + str(checkpoint_path)
+                  if os.path.exists(str(checkpoint_path)) or _last_load_error
+                  else "no checkpoint at " + str(checkpoint_path))
+        if stats_out is not None:
+            stats_out.update({"applied": False, "reason": reason})
+        if progress_callback and _last_load_error:
+            progress_callback(f"  ML correction NOT applied -- checkpoint failed to load "
+                              f"({_last_load_error[:160]})")
         return v37_backbone, h37_backbone, v89_backbone, h89_backbone
 
     try:
@@ -538,7 +616,8 @@ def apply_ml_correction(
         extra = extra_ir or {}
         neutral = np.full((PATCH_SIZE, PATCH_SIZE), 0.0, dtype=np.float32)
         extra_layers = [
-            _norm_tb(extra[b], f"ir_band{b}") if extra.get(b) is not None else neutral
+            _norm_tb(extra[b], f"ir_band{b}")
+            if extra.get(b) is not None and extra_band_trained(b) else neutral
             for b in MODEL_EXTRA_IR_BANDS
         ]
         input_stack = np.stack([
@@ -552,6 +631,10 @@ def apply_ml_correction(
             # genuinely lightning-free scene gives -- deliberately, so the
             # input distribution does not shift with product availability.
             _norm_plain(_flash_layer(flash_density), 0.0, 1.0, 0.0),
+            # ERA5 environment (0.160) -- only for a checkpoint trained
+            # with those channels. None (every live storm) encodes as
+            # zeros with present = 0, the case training rehearses.
+            *(_env_planes(env) if _ckpt_in_channels == MODEL_IN_CHANNELS else []),
         ], axis=0)
         input_stack = np.nan_to_num(input_stack, nan=0.0)
 

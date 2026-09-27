@@ -21,7 +21,7 @@ from __future__ import annotations
 # because a counter wrapped. Note that this ordering does NOT sort
 # correctly as a string, so anything that sorts versions must compare the
 # part after the dot as an integer.
-APP_VERSION = "MWSynth 0.154"
+APP_VERSION = "MWSynth 0.169"
 
 import sys
 import os
@@ -328,7 +328,8 @@ class GenerateWorker(QThread):
             # that fails is simply absent, and its model channel becomes a
             # neutral plane rather than changing the input shape.
             extra_ir = goes_fetch.fetch_extra_ir_bands(
-                sat, target_time, sector=sector, progress_callback=self.progress.emit)
+                sat, target_time, sector=sector, progress_callback=self.progress.emit,
+                anchor=band13)
 
             if band13 is None or band9 is None or band7 is None:
                 raise RuntimeError(
@@ -566,7 +567,7 @@ class GenerateLoopWorker(QThread):
         # that fails is simply absent, and its model channel becomes a
         # neutral plane rather than changing the input shape.
         extra_ir = goes_fetch.fetch_extra_ir_bands(
-            sat, ft, sector=sector, progress_callback=None)
+            sat, ft, sector=sector, progress_callback=None, anchor=band13)
 
         if band13 is None or band9 is None or band7 is None:
             raise RuntimeError(

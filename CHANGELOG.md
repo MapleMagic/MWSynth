@@ -8262,3 +8262,989 @@ rather than a fact -- and the first one I wrote, shipped, and had to
 retract within a single version.
 
 234 tests.
+
+## MWSynth 0.155 — the fit was never applied
+
+The training log opened with:
+
+    Backbone physics vintage: 0.136-32831bd607 (1211)
+
+The same physics ID as before the calibration fit. Since 0.136 the ID is
+DERIVED from the constants, so had the fitted values been written it
+would have changed. **They were never applied. This run used the old
+constants.**
+
+My error. `--step 4` runs mine -> fit -> apply -> re-mine, in that order.
+The first `--apply-fit` run was stopped an eighth of the way through its
+INITIAL mine, before the fit ran. On restart I said the fitted constants
+were "already in your tree", which was false: the step 3 output had only
+ever been printed. The derived physics ID is exactly the check that would
+have caught this before nine hours of mining, and I did not look at it.
+
+### What the run does show
+
+It is not a test of the fit. But one thing changed that is not the
+constants: lightning is live for the first time, where 0.146's run had
+it silently dead.
+
+    flat-offset share, epochs with positive skill
+    previous run (GLM dead)   65%-166%, typically ~100%
+    this run   (GLM live)     52%-102%, median 66%
+
+Before, the network learned essentially nothing but a bias. Now about a
+third of its skill is real structure. Lightning is the only new
+information in the inputs, and it is exactly what both papers point to:
+it sees the mixed-phase column that cloud-top IR cannot.
+
+Confounded, though -- the dataset also shrank (1,211 vs 1,644, stopped at
+EP09), so the East Pacific is under-represented. Suggestive, not proven.
+
+### Display bug
+
+Epoch 1 printed `of that skill, nan%` because skill was -0.069 and the
+share divides by it. That hid the one fact worth reporting: a flat offset
+alone reached +0.135, beating the model outright. Now reported as such.
+
+234 tests.
+
+## MWSynth 0.156 — the fitted constants, reproduced and carried forward
+
+`--step 3 --apply-fit` ran and WROTE the constants this time:
+
+    VH_PHYSICS_ID -> 0.136-788eb12bfc     (was 0.136-32831bd607)
+
+### Two fits, and they agree
+
+The same fit had run once before, on the 1,644-example dataset mined in
+0.146, and was only printed. This one ran on the 1,211-example dataset.
+Different storm mix, different size, lightning dead in one and live in
+the other:
+
+    constant               1644 files   1211 files    diff
+    bg_v_37                     233.1        232.4    -0.7
+    max_depression_h37           36.4         34.6    -1.8
+    max_depression_v89          103.5        105.5    +2.0
+    ... (all twelve)
+    largest disagreement:                            2.0 K
+
+Every constant agrees to within 2.0 K. That is a reproducibility check,
+and a far stronger reason to trust these values than any single fit: they
+are determined by the data, not by which storms happened to be sampled.
+
+Read with that confidence:
+
+- **bg_h_37 181-182**, essentially unchanged from its hand-set 182 -- the
+  constant the wind and atmospheric work targeted, confirmed twice.
+- **bg_v_37 250 -> 232**, matching the ~225-240 K background in real
+  imagery; 250 was simply too warm.
+- **emission_boost_v89 -> 0.2-0.6**: there is no 89V emission term. 0.133
+  added one and reduced it to 5 K; the data says zero.
+- **h37 improves only 5-6%** in both fits. The channel carrying the
+  eyewall emission signature is limited by its model FORM, not its
+  constants, and this is now reproducible rather than a single reading.
+
+### Carried into this tree
+
+The constants are now in this source tree too, and it derives the same
+physics ID -- `0.136-788eb12bfc` -- verified equal. Without this, the next
+version unzipped wholesale would have silently reverted them, the exact
+trap that cost a day earlier: a fitted tree and a shipped tree diverging
+while looking identical.
+
+### An eighth test pinned to a value
+
+`test_writes_only_the_named_constants` used `bg_v_37 == 250` as its
+"untouched constant" sentinel. The fit legitimately moved it to 232.4 and
+the test failed on a correct change. It now compares the constant before
+and after the write, which is the property it was always meant to check.
+
+234 tests.
+
+## MWSynth 0.157 — first live runs from the dev sandbox
+
+The sandbox now has network egress, so the code paths that need S3 --
+the ones every static guard in this project exists to cover because
+nothing could run them -- were executed for the first time. Two mines of
+19 overpasses (one per 2024 Atlantic storm), every byte accounted for.
+Both saved 19/19. Physics ID unchanged: `0.136-788eb12bfc`.
+
+### Full-disk crops fetched 16x what they needed
+
+0.156 described `Rad` as contiguous and row-major, a 434-column crop as
+434 rows strided across 4.7 MB, and ~5 MB as the floor. Opening a real
+file for the first time:
+
+    Rad (5424, 5424) int16, CHUNKED 226x226, gzip 1 + shuffle,
+    524 stored chunks, median 56 KB
+
+None of that model was true. Traced at the HDF5 level, a crop needs
+0.58 MB (9 Rad chunks, 9 DQF chunks, coordinates, metadata); 0.156
+fetched ~10 MB, because:
+
+1. `open_s3_hdf5` wrapped the reader in a 1 MiB `BufferedReader`, which
+   refilled a full MiB after every seek. That alone turned 0.58 MB of
+   need into 6.9 MB of reads.
+2. Each ~56 KB chunk sat in a different 1 MB block.
+
+Now the crop path asks HDF5's chunk index for the exact offset of every
+chunk it touches (`goes_fixed_grid.crop_chunk_spans`) and fetches them
+in ONE parallel wave (`S3RangeReader.prefetch`); ranged opens drop the
+buffer; the remaining ~10 serial metadata reads use 64 KB blocks.
+
+    live, 33 full-disk band files     0.156        0.157
+    fetched                         297.5 MB      31.4 MB
+    per band crop                   ~10 MB        1.0-1.2 MB
+    total received (kernel)          876 MB        555 MB
+
+Pixels and DQF verified bit-identical against the old path. Wall time in
+the sandbox did not move -- it has ample bandwidth to S3 -- so the time
+saving has to be measured on a real home link.
+
+### GLM: the two all-zero cases now say which they are
+
+Beryl (28 Jun) and Ernesto (11 Aug) mined with an all-zero lightning
+channel and no log line, which looked exactly like the `sat`/`satellite`
+failure. It was real: 2 and 0 in-grid flashes against ~1,600-1,900 on
+the disk -- early oceanic cores are lightning-poor. But a dead fetch
+produced the same output and the same silence. The log now always gives
+the disk-wide count (`GLM: 0 of 1501 disk flash(es) inside the grid -- a
+quiet scene, fetch healthy`), shouts on zero across the whole disk,
+includes the exception text on failure, and an unknown satellite name
+RAISES instead of returning zero flashes.
+
+### --estimate rebuilt on measured numbers
+
+It charged 84 MB of GOES per example (real: 3.6), left GLM out (real:
+11.3 MB, the second-largest stream), timed TC PRIMED at a stale 30%
+while printing 95% one line up, assumed 40-70% survival (measured: 96%,
+100%), and -- worst -- ran before `--max-per-storm` was parsed, so a
+capped run was sized as if every overpass would be read. Checked against
+the live run: predicted 0.6 GB, kernel measured 0.555 GB.
+
+For 2018-2025 at 6 per storm: 1,723 of 4,894 overpasses read, ~1,650
+examples, ~51 GB (TC PRIMED 26, GLM 19, GOES 6).
+
+### Memory
+
+Flat 1.4-2.0 GB RSS with 4 workers across the whole run; no leak. (An
+earlier 3.8 GB reading was the instrumentation holding readers alive.)
+
+### Tests -- 240
+
+- The strided-row block-size test is the NINTH found asserting an
+  artefact of a model rather than a fact. Replaced by tests that BUILD a
+  file with ABI's real layout and serve it through a mock S3. The first
+  draft of those also passed against 0.156 -- the file fit in one old
+  1 MB block and the bounds scaled with the constant under test -- so
+  they were made realistic and absolute, and now fail on 0.156 (8,968 KB
+  fetched for 739 KB of chunks) and pass on the fix.
+- `test_missing_glm_gives_zeros_not_an_error` had only ever passed
+  because the test machine had no network. With egress it fetched real
+  lightning and failed. It now makes GLM absent with a stub.
+- New: exact-span prefetch lookup, no MiB buffer on ranged opens,
+  empty-disk vs quiet-scene logging, loud unknown satellite,
+  --estimate honouring --max-per-storm.
+
+## MWSynth 0.158 — groundwork: h37 residual diagnostic, env file inventory
+
+No physics or pipeline changes; physics ID unchanged (0.136-788eb12bfc).
+
+### New: src/diagnose_h37_residual.py (plan item #1)
+
+    python diagnose_h37_residual.py [data_dir]
+
+Mean (real - backbone) per r/RMW bin, per intensity band, all four
+channels, each example weighted once. First reading, 19 live-mined 2024
+AL examples -- far too few to trust, but it has a shape:
+
+- TS strength: h37 -8 K at 0.5-1.5 RMW while v37 is only -2 K there. An
+  H-ONLY deficit near the RMW: the backbone is too WARM in h37 exactly
+  where wind and rain peak, and it is polarisation-specific. Note the
+  sign is the OPPOSITE of the "missing wind-roughening" hypothesis --
+  if anything a surface or emission term is overdone in H near the core.
+- Hurricanes (n small): 89 V/H -8 to -10 K at nearly all radii -- a
+  broad 89 GHz offset, separate from the h37 question.
+Re-run on the full ~1,650-example dataset before acting on either.
+
+### TC PRIMED environmental file: what actually exists (plan item #2)
+
+Per storm, `..._env_s..._e....nc`, 6-hourly ERA5, confirmed on AL022024:
+
+- diagnostics/: shear_magnitude and shear_direction (time, 2 layers, 4
+  regions), shear_generalized, relative_humidity / specific_humidity /
+  theta_e on 23 levels x 4 regions, sst, potential_intensity (empirical
+  and theoretical), precipitable_water, helicity, 10 m winds, vertical
+  velocity, cyclone-phase-space B / thermal wind, center_offset/qc.
+  (sst is (39,1) against 53 times elsewhere -- check alignment.)
+- cylindrical/: 24 azimuths x 61 radii x 23 levels -- RH, winds,
+  vorticity, divergence, w, SST, ERA5 convective/large-scale rain. This
+  is directly usable for shear-relative and dry-air (upshear RH) terms.
+- rectilinear/: 121x121 storm-centred grid, same fields.
+- storm_metadata / overpass_storm_metadata: intensity, storm motion
+  (speed, heading, u/v), distance_to_land, development_level, and
+  intensity_change over 9 periods. LEAKAGE WARNING: some of those
+  periods are almost certainly FUTURE changes -- only past-period
+  columns may ever be model inputs (plan item #18).
+
+Next: interpolate these to each overpass time (6-hourly -> overpass),
+store as NPZ scalars, then shear-relative azimuth in this diagnostic.
+
+## MWSynth 0.159 — one mining pool; the extra IR bands finally exist
+
+Physics ID unchanged (0.136-788eb12bfc). Existing NPZs stay valid.
+Existing checkpoints behave exactly as before (see "Extra IR" below).
+
+### Why mining took ~9 hours: storms ran one at a time
+
+A real 0.157 run on a 250 Mbps link reached AL062018 after 74 min --
+~41 storms at ~1.8 min each. The full-disk fix had already cut 90% of
+the GOES bytes; bytes were not the bottleneck. The loop was:
+
+    for storm in storms:                       # one at a time
+        with ThreadPoolExecutor(workers) as p: # this storm's files only
+            p.map(process, storm_files)        # <= max_per_storm
+
+so --max-per-storm 6 capped concurrency at 6 whatever --workers said,
+and every storm waited on its slowest overpass before the next began.
+Now every storm is prepared first (best track + field-of-view check, 8
+in parallel), then every selected overpass of every storm goes into ONE
+pool. The run order was an accident of sorted() filenames (AL012018,
+AL012019 ... AL012025, then AL022018); it is now season, basin, number.
+
+New test builds five stubbed storms and measures peak concurrency: 2 on
+0.158 with 8 workers and 2 per storm, >= 6 now.
+
+### The global pool needs a memory bound, and has one
+
+The per-storm cap had been silently protecting memory. In the 4 GB dev
+sandbox, four truly concurrent workers were OOM-killed. Measured:
+
+- ~1.4 GB per process regardless of workers -- 933 MB of it is
+  global_land_mask's global array, loaded once and shared by threads;
+- each concurrent overpass: ~0.18 GB in generation (measured at 1, 2
+  and 4 concurrent: +176, +351, +704 MB) plus its band decodes. With
+  the extra IR bands a frame decodes six bands, and a live 2-worker run
+  peaked at 3.5 GB: ~1.05 GB per worker.
+
+`memory_safe_workers()` reads available memory at start (psutil if
+present, else /proc/meminfo or GlobalMemoryStatusEx on Windows), credits
+what the process already holds, and caps workers so the estimated peak
+stays under 80% of it -- logged as e.g. `Memory: 12.0 GB available -> 8
+worker(s), not 14`. Unmeasurable memory leaves --workers untouched.
+
+Live, same 19 overpasses (1 CPU core, so CPU-bound here):
+1 worker 282 s; 2 workers 255 s while ALSO fetching twice the full-disk
+files (the extra bands below). A multi-core machine is where this shows.
+
+### Extra IR: bands 11, 10, 15 had never been fetched -- anywhere
+
+    ValueError: band 11 not in supported set [2, 7, 9, 13]
+
+BAND_INFO listed only 2/7/9/13. list_available_files rejected every
+supplementary band, fetch_frame_bands swallowed the error, and every
+frame -- mining AND the GUI -- fed flat planes to the model's extra-IR
+channels. No train/inference mismatch (both sides equally empty), but
+the multi-channel IR of 0.98/0.99 never reached one example.
+
+- BAND_INFO now has 8, 10, 11, 12, 14, 15, 16. Live check (GOES-16,
+  2 Aug 2024 18:18): 10/11/15 return 500x500 with cold tops 191-193 K,
+  7.3 um warmer than 6.9 um, 12.3 um cooler than 10.3 um -- physical.
+- Failures are counted (goes_fetch.EXTRA_BAND_STATS), the first few
+  logged with the exception, and the mining summary prints
+  `Extra IR bands: N of M fetched`.
+- Training records the fraction of examples with each band real
+  (`Extra IR bands with real data: ...`, saved as
+  `extra_ir_real_fraction` in the checkpoint) and warns on a MIXED set.
+- Inference feeds a real band only to a checkpoint trained with it real
+  in >= 50% of examples. Pre-0.159 checkpoints have no record, so they
+  keep getting flat planes -- exactly what they were trained on.
+
+Existing NPZs lack the bands. Re-mining adds them; backfill_npz.py
+(0.160) will add them in place without re-mining.
+
+### Summary output
+
+`Wall clock: X min for N saved = Y s per saved example`, and the
+per-phase line no longer claims "wall clock is this divided by workers"
+-- that was never true under the per-storm cap.
+
+### Tests -- 245
+
+Cross-storm concurrency; memory cap arithmetic (incl. not double-counting
+resident memory); every model band fetchable; old checkpoints never get
+real extra bands; extra-band failures counted. The frame-ordering test
+now matches regardless of indentation, searches the mining function
+only, and checks band 13 -> coverage check -> rest.
+
+## MWSynth 0.160 — the trained model actually runs; ERA5 environment; backfill
+
+Physics ID unchanged (0.136-788eb12bfc). Existing NPZs and checkpoints
+stay valid; see "What to do" at the end.
+
+### The ML correction had never been applied at inference
+
+Training built the diffusion model at DIFFUSION_BASE_CHANNELS (48) but
+saved its `base_channels` ARGUMENT -- the U-Net default, 32. Inference
+rebuilt every diffusion checkpoint at 32, load_state_dict raised a size
+mismatch, `_load_model_cached` returned None inside `except Exception`,
+and generate_synthetic_mw's own `except Exception: pass` covered the
+rest. Every frame ran WITHOUT the correction and nothing said so.
+Training/validation metrics were real (they use the in-memory model);
+the saved checkpoint was never applied.
+
+- Inference now takes the width from the WEIGHTS (out_conv.weight is
+  (4, width, k, k) in both architectures, torch.compile prefix handled)
+  and the input count from the checkpoint. Existing checkpoints load
+  as they are -- no retraining needed for this.
+- Training saves the width it actually built.
+- A failed load keeps its reason (`ml_inference._last_load_error`),
+  reports it in ml_stats and as "ML correction NOT applied -- ..." in the
+  log; generation's ML block records `ml_stats["error"]` instead of
+  `pass`.
+- Verified: a checkpoint trained by this code loads and corrects h37 by
+  up to ~8.6 K on a real frame; before the fix it did nothing.
+
+Knock-on: the test suite ran the machine's real checkpoint once it could
+load (240 s instead of 15, and stochastic). The default path is now
+resolved at CALL time rather than bound as a default argument, and the
+suite points it at a path that does not exist. 262 tests, ~15 s.
+
+### ERA5 environment from TC PRIMED (tcprimed_env.py)
+
+Each storm's env file (14-222 MB) is read ranged: 1-4.5 MB per storm.
+Facts taken from a real file, not assumed: packed int16 (scale/offset/
+fill applied by hand); layers 850-500 / 850-200 hPa and regions 0-300,
+0-500, 0-800, 200-800 km exist only as attribute labels, so they are
+CHECKED on every read and a reordered file raises; shear direction is
+where the vector points (westerly = 90 deg); intensity change periods
+-24..+24 h with negative = past, and only past ones are exposed.
+
+Per overpass: deep and mid shear (magnitude, heading), 700-500 and
+850-700 hPa RH (200-800 km), core SST (r <= 50 km), potential intensity,
+storm motion, past 12/24 h intensity change. Beryl 2024, recovered from
+the file: +54 kt in the 24 h to 30 Jun, -27 kt by 4 Jul, 30 m/s shear
+after landfall.
+
+Mining fetches it once per storm in the parallel prep phase and writes
+env_* scalars into every NPZ (NaN where unknown), plus `goes_satellite`.
+
+### Every band now comes from band 13's own scan
+
+Bands chose mesoscale-or-full-disk independently. A backfill asking for
+the right TIME got a mesoscale scan where band 13 was full disk; 8.4 vs
+10.3 um correlation fell from 1.000 to 0.857. `get_band_image_matching`
+pins sector AND scan start (10 s tolerance; the next scan is >= 30 s
+away), and mining, the GUI's fetch_extra_ir_bands and the backfill all
+use it. Live mine, 19 overpasses: 19 saved, 57/57 extra bands, b11-b13
+correlation >= 0.9992 in every file, environment in all 19.
+
+### backfill_npz.py -- add extra IR + environment without re-mining
+
+    python backfill_npz.py [data_dir] [--workers N] [--only extra-ir|env]
+
+Re-fetches band 13 until it reproduces the stored ir_band13 EXACTLY
+(default choice, full disk, M1, M2), then takes the extra bands from
+that scan and regrids them with generation's own _regrid_to. Verified on
+8 live-mined NPZs with their bands stripped: 24 of 24 band arrays
+bit-identical to what mining wrote, every other array unchanged. ~8 s
+per file per worker here. Atomic rewrite; idempotent.
+
+### Environment as model input (plan #11)
+
+Eight constant planes appended at the END of the layout (shear as
+east/north components, mid RH, SST, past-24 h change, motion u/v, and a
+present flag), from ONE encoder (`tcprimed_env.encode_env`) shared by
+training and inference. Training withholds the environment at random
+(ENV_DROPOUT_P 0.3) because live storms have none -- TC PRIMED is
+retrospective -- and the model must meet that case in training first.
+Pre-0.160 (15-channel) checkpoints are still served, with the stack
+stopping before the environment: verified, the environment changes
+their output by exactly 0.000 K. A 2-epoch 23-channel model trained on
+live-mined data loads, and the environment moves its output (max 2.1 K).
+
+### Diagnostic
+
+`diagnose_h37_residual.py [dir] --csv out.csv` adds shear-relative
+quadrants (NH), the h37 radial profile by shear strength, and
+convective-burst metrics inside the RMW (cold tops < 208 K, GLM) for
+past-24 h RI vs other. First look, 8 examples, not evidence: the h37
+deficit at 1-2 RMW sat downshear (DL -9.5 K, DR -6.3 K; upshear ~0).
+
+### Checked, unchanged
+
+Plan #8: the train/val split is already by storm and intensity-
+stratified.
+
+### What to do
+
+1. Update. Your EXISTING checkpoint now actually runs in the GUI.
+2. When the current mine finishes: `python backfill_npz.py`.
+3. Retrain once: the log should show "Extra IR bands with real data:
+   ... 100%" and "ERA5 environment present in 100% of training examples".
+4. `python diagnose_h37_residual.py --csv h37.csv`.
+
+## MWSynth 0.161 — mining in separate processes
+
+Physics ID unchanged (0.136-788eb12bfc). NPZs, checkpoints and the
+0.160 backfill are unaffected.
+
+### Why threads gave no parallelism
+
+A real threaded run (1,237 examples, ~6 in flight) timed each phase
+against the same phase run alone:
+
+    phase       alone    in the run
+    mw_read     0.8 s      8.6 s
+    goes        6.8 s     63.3 s
+    extra_glm   1.1 s      9.1 s
+    generate    5.0 s     35.8 s      <- no network at all
+    total      ~14 s     117 s        ~8x
+
+Every phase ~8x slower, generate included: the workers were waiting on
+each other, and 117 s / ~6 in flight is ~20 s per example -- one at a
+time. Threads in one process share Python's GIL and h5py's global lock
+(all HDF5 calls, from any thread, are serialised), and every phase is
+HDF5 or Python-heavy. 0.159's single pool fixed a real barrier, but not
+where the hours went.
+
+### Now: one worker PROCESS per overpass slot
+
+- `_mine_overpass(job)` is a module-level function: everything it needs
+  arrives in the job, everything the parent needs comes back in a record
+  (status, skip reason, log lines, phase times, CPU seconds, peak memory,
+  extra-band counts). No shared state, so it runs the same in a thread
+  (`--threads`) or a process (default). Spawn start method everywhere --
+  what Windows always uses -- so this sandbox tests the Windows path.
+- Each overpass's log lines now print together when it finishes instead
+  of interleaving.
+- End of mining prints `CPU: N core(s) busy on average ... peak worker
+  memory X GB` -- the direct test of whether the cores are actually used.
+- Live, 2024 AL, 1 per storm, 2 worker processes: 19/19 saved, 57/57
+  extra bands, 641 MB received -- identical to the threaded run. This
+  sandbox has ONE core, so wall time could not improve here (0.9 cores
+  busy, i.e. saturated); a multi-core machine is where it shows.
+
+### Memory
+
+- Measured peak per worker PROCESS: 1.33 GB. The memory cap now uses
+  that (PER_PROCESS_GB 1.35) plus a small parent, and says what it chose.
+- global_land_mask decompresses a 933 MB byte-per-cell mask at import --
+  per process, in process mode. It is now bit-packed (117 MB) into
+  ~/.synthetic_mw_tc/cache/ and memory-mapped, so the OS shares one copy
+  across all processes and reads only the pages looked up. Built once,
+  in a short-lived subprocess (~2 s), by the parent before any worker
+  starts. Identical to globe.is_land on 2 M random points, poles, the
+  dateline and all 19 real storm grids; non-finite coordinates are ocean
+  instead of an IndexError.
+- run_ml_pipeline.py no longer imports ml_train (and so torch) at the
+  top: Windows re-imports the entry script in every worker process.
+
+### Mining no longer runs the ML model
+
+0.160's loader fix meant generation's default ML correction actually
+ran -- a full diffusion ensemble per overpass -- during MINING, where the
+NPZ stores the backbone with the ML contribution subtracted back out.
+Pure cost. Mining now calls generate with ml_strength=0.0.
+
+### Other
+
+- Storm preparation always uses 8 threads; it was tied to the memory-
+  capped worker count (2 in a small sandbox -> 2.4 min of a 6.6 min run).
+- `--threads` restores in-process threads if processes misbehave.
+
+### Tests -- 268
+
+Real spawned-process mining (pickling, records, skips, CPU stats) with
+no network; a static check that every name the worker uses resolves in
+a fresh process (the first draft used `tp`, imported only inside another
+function -- every overpass became NameError); the packed mask against
+global_land_mask; the entry script does not load torch.
+
+Not testable here, so watch on the first real run: Ctrl+C with worker
+processes on Windows may leave them finishing their current overpass
+before exiting.
+
+## MWSynth 0.162 — real resume, safe writes, skill by radius, regime weighting
+
+Physics ID unchanged (0.136-788eb12bfc). Existing NPZs, checkpoints and
+the 0.160 backfill are unaffected.
+
+### Resume now skips the work, not just the write
+
+0.117's "resumability" lived in export_training_example -- the LAST step
+-- so a resumed mine re-downloaded the overpass, all six GOES bands and
+~30 GLM granules, and regenerated the frame, before finding the file
+already existed. The output name needs band 13's scan time, unknown
+until band 13 is fetched, so resume is now decided from what IS known
+up front, the TC PRIMED overpass name:
+
+- `mining_ledger.jsonl` in the data folder (outcome + physics ID per
+  overpass; deterministic skips like goes_does_not_cover_storm are
+  remembered, network/exception skips always retried);
+- `source_overpass`, written into every NPZ from now on;
+- for older NPZs: same storm + sensor, GOES scan within 15 min of the
+  overpass time (one sensor's passes over one storm are hours apart).
+
+Only files under the CURRENT physics ID count, so a physics change still
+re-mines for real. Applied BEFORE storm preparation: a storm with
+nothing left is never prepared. `--fresh` redoes everything.
+
+Live: re-running a finished 19-overpass mine recognised all 19 from the
+older NPZs and fetched nothing. Wall time for that do-nothing run went
+135 s -> 44 s (resume before prep) -> 2.3 s (below).
+
+### Writes are atomic; temp files never become training data
+
+- Export wrote straight to the final name, so an interrupted mine -- a
+  closed laptop -- could leave a truncated .npz. It now writes a temp
+  file and renames.
+- Every reader (training, both diagnostics, calibration, backfill) lists
+  data through `training_data_export.list_training_files()`, which never
+  returns temp files.
+- backfill_npz.py removes temp files older than 10 minutes left by an
+  interrupted run (not newer ones: a run writing right now isn't dead).
+- Export's own existing-file skip now also requires the current format,
+  so `--fresh` rewrites older files instead of keeping them.
+- The test suite was writing its stubbed outcomes into the REAL data
+  folder's ledger. Default paths are now resolved per call and the suite
+  redirects them to a temp directory.
+
+### Skill by radius (plan #10)
+
+Every diffusion epoch now prints skill in r/RMW bins 0-1, 1-2, 2-4, 4+
+for all channels and for h37 alone, from an r/RMW plane cut with the same
+_extract as the inputs (validation only; never an input).
+
+### Regime weighting (plan #19)
+
+Training draws with a WeightedRandomSampler: past-24 h intensification
+>= +30 kt x3, deep shear >= 10 m/s x2, capped at x4, same epoch length.
+Off (and says why) unless at least half the examples carry the ERA5
+environment. On the live-mined 2024 set: high-shear examples 26% of the
+data, 42% of what training draws. Recorded in the checkpoint.
+
+### Speed
+
+Measured, then acted on where it paid:
+
+- Preflight: once 0.160 made checkpoints load, the pipeline's synthetic
+  check ran the full diffusion ensemble on the CPU -- 42 s of every run.
+  Now ml_strength=0.0, like mining. So are the older single-storm mining
+  paths, which also write the backbone. A test pins it.
+- TC PRIMED listing: one storm directory at a time (~0.17 s each, ~51 s
+  for 301 storms), and done twice per run (estimate, then mining). Now
+  parallel, and cached for the rest of the run.
+- generate: 78% of its time is scipy regridding the swath. Geometry is
+  now reused, and interpolation skips pixels the distance mask discards
+  anyway: ~5% faster, all 20 output arrays bit-identical. The Delaunay
+  triangulations themselves are the physics' cost -- V and H have
+  different missing pixels, so no two of a frame's six share points.
+
+Measured and NOT changed, with the numbers for later:
+
+- GLM ranged reads: flash data is 6 KB of a 274 KB granule, but reaching
+  it costs 3-12 serial requests per granule; best trade saves ~5.5 GB
+  (~3 min at 250 Mbps) per full mine. Not worth the round trips.
+- TC PRIMED ranged reads: the old "93-100% of each file is read" note
+  described the DOWNLOAD. The reader needs only 4-11% (AMSR2 1.64 MB of
+  14.8, GMI 0.70 MB of 17.9) once the channel map is remembered per
+  instrument, fetched as one parallel wave of chunk spans -- but it costs
+  ~20-24 serial metadata requests instead of 1. That wins only when the
+  mine is bandwidth-bound: at ~12 s per example, ~13+ processes would
+  saturate 250 Mbps with whole files. Decide from the next real run's
+  `CPU:` line and throughput.
+
+### Tests
+
+New: resume sources, match window, physics gating, retry of non-
+deterministic skips; temp files never listed; every reader uses the
+helper; atomic export; mining/pipeline generate calls keep the model
+off. The estimate's listing test now also catches double listing.
+
+## MWSynth 0.163 — offline backbone replay, and a sweep for the h37/89 fix
+
+Physics ID unchanged (0.136-788eb12bfc): the new physics hook ships OFF.
+
+### What the full diagnostic said (1,237 examples, 226 storms)
+
+Storm-level uncertainties; real - backbone:
+- 37 GHz, inner core: too warm under deep convection -- about -15 K per
+  unit of cold-top (< 208 K) coverage, for storms >= 34 kt; cloud-free
+  core quadrants are only 2-5 K off at every intensity, so this is NOT
+  wind roughening (which would grow with intensity where winds peak).
+  The error is ~3x larger in H than V: emission-like, not scattering.
+- 37 GHz asymmetry: at equal cold-top coverage, downshear-left is
+  +5.1 +/- 1.4 K warmer (relative to the backbone) than upshear-right,
+  growing with shear and intensity. The backbone has no shear.
+- 89 GHz: both polarisations too warm at all radii for hurricanes, and
+  increasingly with intensity (-6, -14, -23 K at 2-4 RMW for 34-64,
+  64-96, 96+ kt) -- a scattering deficit whose size depends on
+  intensity, which a single fitted amplitude cannot supply.
+(The 8-example hint in 0.160 -- deficit "downshear" -- was noise.)
+
+### backbone_replay.py -- rerun the physics on stored examples, no network
+
+    python backbone_replay.py --check [--limit N]
+    python backbone_replay.py --sweep
+
+Rebuilds each example's inputs from the NPZ (bands, grid, lightning,
+storm position/intensity/RMW/ROCI, sensor) and runs generation with no
+swath and the model off -- ~0.75 s per example instead of a mine.
+
+`--check` must pass before any result is trusted. It found two things:
+- Export writes band 2 as an EMPTY array when a frame has none; replay
+  now treats that as absent (it had failed 8 of 19).
+- The stored backbone's TEXTURE amplitude comes from the REAL swath
+  ("tex_amp = measured if swath else default", and the noise floor at
+  0.4x) -- a small target leak: training backbones carry texture scaled
+  to the answer, inference uses defaults. Texture is linear and passes
+  through the sensor PSF, so the check solves for the one swath-measured
+  amplitude per channel; what remains must be storage rounding. Result:
+  19 of 19 exact, worst 0.010 K (the 0.01 K storage step). The leak
+  itself is to be removed, with a physics-ID change, together with the
+  next physics revision -- one re-mine, not two.
+Generation gained `psf_sensor=` so replay blurs with the example's own
+sensor instead of the default.
+
+### The depression hook, and a sweep that fits it from data
+
+DEPRESSION_INTENSITY_GAIN (all 0 = the fitted physics, bit-identical;
+enters the physics ID only when nonzero) scales each channel's
+scattering depression by 1 + gain * ramp(vmax).
+
+The backbone is LINEAR in that gain -- verified to 1e-13 K -- and the
+ramp is one number per example. So `--sweep` replays each example twice
+(gain 0; depression doubled everywhere) and from stored sums gets the
+backbone for ANY gain and ANY intensity dependence. It reports:
+- the least-squares extra depression per intensity band, fitted on each
+  half of the storms separately (agreement is the test);
+- an out-of-sample score: fit on one half, RMSE on the other;
+- the diagnostic's radial tables and inner-core cold/cloud-free means,
+  before and after.
+Guards: a band gets no gain unless >= 5,000 pixels in >= 5 storms are
+moved > 0.5 K, and gains are clamped to [-1, +3]. Unguarded, 19 examples
+produced +1,283 in a near-empty band -- and the out-of-sample score
+caught it (h37 RMSE 20 -> 74 K), which is what it is for.
+
+### Tests -- 277
+
+Zero gain is the fitted physics; nonzero gain changes the ID and follows
+its ramp; the sweep's quadratic sums equal direct computation and recover
+a planted gain; bands without signal get no gain; empty band arrays are
+absent.
+
+## MWSynth 0.164 — the replay check says WHY a file differs
+
+Physics ID unchanged (0.136-788eb12bfc).
+
+First run on real data: `--check --limit 100` reproduced 99 of 100; the
+exception, AL132022 at 2022-10-10 08Z (Julia, just off El Salvador),
+differed by up to 2.6 K. Mined HERE with current code, the same overpass
+reproduces exactly (0.007 K), so the difference belongs to the copy mined
+by 0.157/0.158 on the user's machine. Satellite selection was ruled out
+(GOES-16 either way).
+
+- `--check` now compares the land fraction and elevation replay computes
+  against those MINING stored, and for any mismatching file replays again
+  WITH mining's surface fields: if that reproduces, it prints "CAUSE
+  FOUND: mining used different land/elevation data". Verified on a
+  controlled case -- Julia re-mined with the land mask forced off differs
+  by up to 109 K, 87,830 px of land fraction differ, and the stored-
+  surface replay reproduces to 0.006 K. (So the user's 2.6 K is NOT a
+  missing land mask: something much smaller differs, which the new
+  output will name.)
+- The verdict is graded: <= 2% of files differing by < 5 K cannot bias a
+  fit pooled over the whole set, so sweep results are reported usable
+  and the files listed for understanding; anything worse still blocks.
+- Prints which land-mask backend the replaying machine uses.
+- `replay_backbone(..., stored_surface=True)` hands generation the stored
+  surface fields; a test proves they are installed and always restored.
+
+## MWSynth 0.165 — the one mismatch explained; pin the land mask
+
+Physics ID unchanged (0.136-788eb12bfc).
+
+0.164's check on the user's machine: 99/100 exact; Julia (AL132022,
+2022-10-10 08Z) differs by up to 2.6 K; the machine's land mask is
+CARTOPY; land fraction differs from what mining stored at 21 coastal
+pixels (max 0.11). The check then said "not the surface fields" -- WRONG,
+and the bug was mine: replay installed the stored land fraction by
+patching surface_type.land_fraction, but export stores the field AFTER
+generation smooths and clips it, so it was smoothed twice (5.0 K off,
+worse than recomputing). A test built on an all-zero field could never
+see that.
+
+- generate_synthetic_mw(surface_override=) installs stored land fraction
+  and elevation AFTER that processing; replay uses it.
+- Verified on the case the old test could not see: Julia re-mined with 30
+  coastal pixels flipped differs by 12 K; the check finds 537 px of land
+  fraction differing and the stored-surface replay reproduces to 0.007 K
+  -> CAUSE FOUND. Its per-channel ratios (h37/v37 1.82, h89/v89 1.66)
+  match the user's file (1.83, 1.69): the user's mismatch is cartopy's
+  coastline having changed between the mine and the replay.
+- Preflight prints the land-mask backend and warns when it is not the
+  pinned 1 km global_land_mask copy.
+
+For the next full mine: `pip install global-land-mask`. The backend is
+not in the physics ID yet -- it will be added with the physics revision,
+so that re-mine carries one consistent coastline throughout.
+
+## MWSynth 0.166 — three-lever sweep; the land mask was coarser than anyone knew
+
+Physics ID unchanged (0.136-788eb12bfc): every new lever ships OFF.
+
+### What the 0.165 sweep showed (1,236 examples, 226 storms)
+
+An intensity-dependent DEPRESSION amplitude fixes neither channel:
+- 37 GHz: both halves pin the gain at its floor (-1, "remove the
+  depression") yet out-of-sample RMSE does not move (10.69 -> 10.69,
+  20.25 -> 20.25). Where the backbone applies 37 GHz depression it is
+  already slightly too cold; the too-warm core lives elsewhere -- as the
+  polarisation evidence said (H-dominant, emission-like).
+- 89 GHz: halves agree on direction (+0.3 .. +1.4, rising at the top),
+  but only ~1% out of sample (12.61 -> 12.48), because extra depression
+  lands in the cold-topped core -- already right (+2.8 K), made +16.5 K
+  too cold -- while the real deficit is at 2-6 RMW (-14 to -22 K).
+The harness did its job: a hypothesis rejected in 40 minutes, no re-mine.
+
+### Two more levers, and a sweep that fits them jointly
+
+- EMISSION_GAIN (per channel): scales the E*S*(1-P) term.
+- OUTER_DEPRESSION_GAIN (per channel): depression weighted 0 inside
+  1.5 RMW, 1 beyond 2.5 RMW, from the best-track centre.
+All three levers verified linear (1.7e-13 K) and exactly ADDITIVE
+(4.5e-13 K) on real frames, so `--sweep` replays each example 4 times
+(base + one per lever) and fits any combination by arithmetic:
+- which lever carries the fix: out-of-sample RMSE for each lever alone
+  and all three together, fitted on one half of the storms, scored on the
+  other (both directions);
+- joint per-band gains by bounded least squares, per half;
+- before/after radial tables and inner-core cold/cloud-free means.
+Files that stored band 2 on its own finer grid (lat/lon never saved)
+are reported by name as not rebuildable instead of failing obscurely.
+
+### The land mask: cartopy's 110m coastline
+
+The user's machine has no global_land_mask, so the backbone has used the
+cartopy fallback -- which downloads Natural Earth at 1:110 million scale.
+Measured here on real grids:
+- 1.4 s per frame (packed 1 km mask: 0.01 s) -- a real part of replay
+  (5.9 s per example on that machine vs 0.75 s here) and of mining;
+- it MISSES Guadeloupe, Barbados, Nassau, Key West and Grand Cayman
+  entirely: the backbone has treated them as open ocean.
+Every example now records `land_mask_backend`, training prints the mix
+and warns when a dataset combines masks, and preflight (0.165) says which
+is active. `pip install global-land-mask` before the next mine.
+
+### Other
+
+- `run_ml_pipeline.py --data-dir PATH`: steps 1-3 read and write there,
+  so a test mine never mixes with -- or resumes over -- another dataset.
+- A leftover ledger in an emptied folder is harmless: "saved" entries
+  whose files were moved are re-mined; only deterministic skips carry.
+
+### Tests -- 281
+
+Joint fit recovers two planted gains at once; RMSE from stored sums
+equals the direct pixel computation; a lever without signal stays out;
+new levers off by default and in the ID when on; the outer-band weight
+ramps 0 -> 1 between 1.5 and 2.5 RMW.
+
+## MWSynth 0.167 — a sweep built to decide the physics revision in one run
+
+Physics ID unchanged (0.136-788eb12bfc): every lever ships OFF.
+
+### What 0.166's three-lever sweep showed (1,644 examples, 300 storms)
+
+- 89 GHz: the OUTER-BAND depression carries the fix (v89 12.53 -> 12.21,
+  h89 15.87 -> 15.63 out of sample); gain ~+2 in both halves at EVERY
+  intensity, so the missing outer-band scattering is not intensity-
+  dependent. h89's emission term: -1.00 in all 14 band fits -- remove it.
+- 37 GHz: emission gains -0.1..-0.2 agree between halves for storms
+  < 64 kt and halve the inner-core bias in-sample, yet all-pixel RMSE
+  does not move (20.27 -> 20.25). The metric could not show it: RMSE over
+  the whole ~1,000 km grid, where everything inside 2 RMW is ~2% of the
+  pixels -- and the fits were dominated by the outer region too.
+
+### Scoring fixed
+
+- Out-of-sample RMSE per radial ZONE -- core 0-2, bands 2-4, outer 4-8
+  RMW (and env > 8, never fitted) -- fit on one half of the storms,
+  scored on the other, both directions.
+- Fits are ZONE-BALANCED by default (each zone weighted by 1 / its pixel
+  count, so the core counts as much as the outer region); the all-pixel
+  objective is shown alongside. A test plants opposite needs in a small
+  core and a large outer zone: all-pixel follows the outer, balanced
+  does not.
+- OCEAN pixels only (land fraction < 0.05); land scored separately,
+  never fitted.
+
+### Everything else the revision needs, in the same run
+
+- Two more replayed levers: a FAR outer depression ramp (3.5 -> 5 RMW),
+  so the radial shape of the 89 GHz fix is fitted rather than assumed;
+  and SHEAR-ASYMMETRY levers on emission and on depression -- weight
+  cos(angle from downshear-left), +1 DL .. -1 UR, from the stored ERA5
+  heading (0 where unknown) -- testing whether physics can carry the
+  +5-6 K DL-UR h37 asymmetry. All seven levers verified linear (1.7e-13
+  K) and exactly additive (8.5e-13 K).
+- A constant OFFSET lever (bg), exact with no replay (smoothing and the
+  PSF preserve a constant): separates plain bias from structure, e.g.
+  weak storms' h89 background.
+- Per-band vs ONE GLOBAL gain, out of sample: is intensity dependence
+  needed at all?
+- Robustness: global gains refitted without the worst 2% of examples.
+- Shear-quadrant means inside 2 RMW, before -> after.
+- `--audit`: the dataset the sweep will use, from the NPZs alone --
+  physics IDs, land masks, shear availability, missing RMW, land share,
+  real-MW coverage of the core, examples/storms per band.
+- Results SAVED (`sweep_<physics>_<time>.pkl.gz`, float32 + gzip: ~14 MB
+  for 1,644 examples; fits identical to 4 decimals) and `--report FILE`
+  redoes any analysis with no replays. The printed report is computed
+  from the saved file, so the two always match.
+
+Cost: 7 replays per example (base + 6 levers), ~1.75x 0.166's sweep.
+
+### Owed fixes
+
+- `--fresh` still WRITES the resume ledger (it only stops it skipping).
+- "Entire field is invalid/missing" overpasses (17 in the full mine) are
+  known skips: a resume no longer refetches them.
+
+### Tests -- 287
+
+## MWSynth 0.168 — PHYSICS REVISION, fitted by offline replay
+
+Physics ID: 0.136-788eb12bfc -> 0.168-7df00b52e9. Every existing NPZ and
+checkpoint is the OLD physics: re-mine, then retrain (inference warns on
+the mismatch until then).
+
+### How it was chosen
+
+From the 0.167 sweep's saved results (1,644 examples, 300 storms), with
+no further replays: candidate lever sets scored OUT OF SAMPLE per radial
+zone (fit on one half of the storms, scored on the other, both ways).
+- The physical set captures everything the levers can: the same as all
+  levers minus the offset, in every zone. Asymmetric depression at
+  37 GHz and asymmetric emission at 89 GHz add nothing: dropped.
+- Smooth piecewise-linear curves in Vmax (knots 20/45/70/95/125 kt) match
+  per-band steps. 37 GHz needs no intensity dependence; 89 GHz does.
+- Fitted separately on each half, the curves agree closely.
+- Wider limits: 37 GHz gains wander with IDENTICAL held-out scores (the
+  data cannot tell them apart) -> physically meaningful -1 kept. 89 GHz
+  far scattering runs to +8, h89 emission to -3, for < 1 point: the
+  missing broad-scattering physics pushing on whatever lever reaches it.
+  Not adopted; it is the next question.
+- The offset lever is NOT adopted (worth about as much again at 89 GHz --
+  that is the same missing physics, and the ML handles mean bias).
+
+Out of sample, per zone (both halves):
+    v37  core -0.4..-0.8%   bands -0.2..-0.4%   outer -0.2%
+    h37  core -1.6..-2.0%   bands  ~0           outer  ~0
+    v89  core -2.4..-2.7%   bands -4.9..-5.4%   outer -4.4..-6.4%
+    h89  core -2.0..-2.1%   bands -3.1..-3.2%   outer -2.2..-3.0%
+
+### What changed (synthetic_algorithm.ADOPTED_CURVES)
+
+- 37 GHz: no scattering depression (-1 at every intensity), none in the
+  outer bands (-1); small emission adjustments; emission shifted
+  DOWNSHEAR-LEFT (+0.04 at depression strength, +0.38 near 70 kt, ~+0.2
+  beyond).
+- 89 GHz: outer-band (1.5-2.5 RMW) scattering +3 in weak storms easing
+  to +1 from 70 kt; far (3.5-5 RMW) +3 up to 45 kt fading to +0.2..0.5 in
+  majors; core depression -0.4 near 70 kt; h89 emission OFF (-1);
+  scattering shifted downshear-left (+0.3..+0.4).
+- Every adjustment acts over OCEAN only, scaled by the ocean fraction:
+  the sweep showed the same gains making land pixels worse.
+- The asymmetry is Northern Hemisphere only (fitted there).
+Verified: on real frames the implemented physics equals the fitted
+linear model to 1.1e-12 K -- it does exactly what was scored.
+
+### Texture leak removed
+
+The stored training backbone no longer carries texture scaled from the
+real swath: the swath-measured excess (texture + floor, through the same
+sensor PSF) is subtracted at export, as the baseline shift is. Displayed
+frames keep it. Verified: generation with and without the swath gives
+the SAME stored backbone to 0.000 K, and a 0.168 NPZ reproduces as
+stored (0.009 K) with no texture solve.
+
+### The coastline is part of the physics ID
+
+`land_mask=gl-1km | cartopy-110m | none` (decided without loading
+anything, so safe in spawned workers). Data mined with different
+coastlines can no longer share an ID.
+
+### Mining passes the ERA5 environment INTO generation
+
+It was computed only at export, so mined backbones would have lacked the
+asymmetry the replay includes. Fixed on all three mining paths.
+
+### Replay
+
+- `--physics 0.136` replays data mined before this revision (sets
+  MWSYNTH_PHYSICS=0.136, which spawned workers inherit; reproduces the
+  old ID exactly). The check notes files made under other physics
+  instead of reporting them as failures.
+- Check fix: the stored backbone is compared AS IS first; the one
+  swath-measured texture amplitude is solved for only if that fails
+  (pre-0.168 files). Solving unconditionally "corrected" an exact 0.168
+  match by 5 K.
+
+### Tests -- 293
+
+Land untouched and ocean changed by the revision (synthetic hurricane,
+curves on vs off); curve interpolation and flat ends; 0.168 ID, and
+MWSYNTH_PHYSICS=0.136 in a fresh process reproducing 0.136-788eb12bfc;
+asymmetry NH-only; environment passed before generation; texture excess
+subtracted from every stored channel.
+
+## MWSynth 0.169 — a skill number you can select on
+
+Physics ID unchanged (0.168-7df00b52e9). No re-mine: retrain only.
+
+### Why
+
+The first training on the 0.168 stack worked end to end (vintage,
+extra IR 99-100%, ERA5 100%, 1 km mask, regime weighting 33% -> 51%),
+but its per-epoch sampled skill swung +0.21, +0.17, +0.003, -0.10,
++0.13 ... while the validation loss fell smoothly from 0.36 to 0.077.
+The number was measured on the FIRST 4 VALIDATION BATCHES with FRESH
+diffusion draws every epoch. It chose the checkpoint (epoch 7, loss
+0.120, likely a lucky draw) over epochs with far lower loss, and its
+patience stopped the run at epoch 17 with the loss still improving.
+(0.166 made skill the selection metric deliberately: in one run the
+lowest-loss epoch was not the best model. The metric was right; its
+measurement was too noisy to select on.)
+
+### Now
+
+- Per-epoch skill on a FIXED, intensity-stratified subset of 96
+  validation examples, with SEEDED draws (a torch.Generator per batch --
+  the global RNG training uses is untouched): the same model always gets
+  the same number, so a change between epochs is the model changing.
+- Validation and checkpoints use an exponential moving average of the
+  weights (decay 0.999, warm-up), standard for diffusion models.
+- Two checkpoints: best by skill (`mw_correction_best.pt`) and best by
+  validation loss (`mw_correction_best_loss.pt`).
+- At the end both are scored on the FULL validation set (8 members,
+  seeded) and the better becomes the default the GUI loads.
+- Early stopping cannot trigger before epoch 20.
+- The duplicate land-mask line in the training log is gone.
+
+### A test bug that had been corrupting torch
+
+TestPipelineCLI stubbed torch with `setdefault`, so with REAL torch
+loaded it kept it -- and then overwrote torch.nn.Module, torch.Tensor,
+Dataset and DataLoader with `object`, and could plant a fake
+ml_diffusion, for every test that ran afterwards. TestMLInference
+replaced torch with a SimpleNamespace and never restored it. Stubbing
+now happens only when torch is absent, TestMLInference restores the
+real module, and a test checks torch is intact after both.
+
+### Tests -- 299
+
+Seeded skill reproducible (and unseeded not); seeding leaves the global
+RNG alone; the whole loader by default; the subset fixed and spanning
+intensity; no stop before the minimum; both checkpoints and the final
+selection wired in; real torch survives the stubbing tests.

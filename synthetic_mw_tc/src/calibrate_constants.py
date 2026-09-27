@@ -348,7 +348,7 @@ def fit_from_dataset(data_dir=None, progress_callback=None) -> dict:
 
     if data_dir is None:
         data_dir = tde.DEFAULT_EXPORT_DIR
-    paths = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+    paths = __import__("training_data_export").list_training_files(data_dir)
     return fit_from_examples(paths, CALIBRATION, progress_callback=progress_callback)
 
 

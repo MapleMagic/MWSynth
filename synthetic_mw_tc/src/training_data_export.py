@@ -139,10 +139,32 @@ def check_physics_consistency(file_paths: list, strict: bool = True) -> dict:
     return groups
 
 
+def _land_mask_backend() -> str:
+    try:
+        import surface_type
+        return surface_type.backend_name()
+    except Exception:
+        return "unknown"
+
+
+def list_training_files(data_dir: str = None) -> list:
+    """Every finished training example in `data_dir`, sorted -- never a
+    temp file. All readers use this (0.162). Writers now write to a temp
+    name and rename; `*.npz` alone would pick up a temp file left by an
+    interrupted run (a backfill or mine stopped mid-write) and train on it."""
+    import glob
+    d = data_dir or DEFAULT_EXPORT_DIR
+    return sorted(f for f in glob.glob(os.path.join(d, "*.npz"))
+                  if ".tmp" not in os.path.basename(f)
+                  and not os.path.basename(f).endswith(".backfill_tmp.npz"))
+
+
 def export_training_example(
-    band13, band9, band7, band2, storm_fix, result, output_dir: str = DEFAULT_EXPORT_DIR,
+    band13, band9, band7, band2, storm_fix, result, output_dir: str = None,
     extra_ir: dict | None = None,   # override; defaults to the regridded
                                     # arrays the model actually saw
+    env: dict | None = None,        # tcprimed_env.env_at() scalars (0.160)
+    source_overpass: str | None = None,   # TC PRIMED filename (0.162, resume)
 ) -> str | None:
     """Save one paired training example, if real MW data was actually
     used in this generation AND it came from GMI or AMSR2 specifically
@@ -157,6 +179,9 @@ def export_training_example(
     storm_fix: the StormFix used for this generation.
     result: the SyntheticMWResult returned by generate_synthetic_mw.
     """
+    if output_dir is None:
+        output_dir = DEFAULT_EXPORT_DIR      # resolved per call (0.162)
+
     diag = result.diagnostics
     if not diag.get("fusion_sources_used", {}).get("mw"):
         return None
@@ -181,12 +206,19 @@ def export_training_example(
     # physics. A stale-vintage file must be redone, not reused, or the
     # dataset silently mixes vintages and the 0.99 guard refuses to train
     # on it later.
+    #
+    # 0.162: that skip also requires the CURRENT format (source_overpass,
+    # written from 0.162 on). An older file under the same physics lacks
+    # the environment and extra IR; a deliberate re-mine (--fresh) must
+    # rewrite it, not keep it. Mining's ResumeIndex now does the real
+    # skipping, BEFORE any fetch; this is only the last line of defence.
     if os.path.exists(path):
         try:
             with np.load(path, allow_pickle=True) as _d:
                 _vid = (str(_d["vh_physics_id"])
                         if "vh_physics_id" in _d.files else None)
-            if _vid == _vh_physics_id():
+                _current_format = "source_overpass" in _d.files
+            if _vid == _vh_physics_id() and _current_format:
                 return path
         except Exception:
             pass    # unreadable or half-written -- fall through and rewrite
@@ -209,8 +241,12 @@ def export_training_example(
     def _f32(x):
         return x.astype(np.float32) if x is not None else np.array([], dtype=np.float32)
 
+    # Atomic (0.162): write a temp file, then rename. A mine interrupted
+    # mid-write -- a closed laptop -- used to leave a truncated .npz under
+    # the final name. list_training_files() never returns temp names.
+    tmp_path = path[:-4] + f".tmp{os.getpid()}.npz"
     np.savez_compressed(
-        path,
+        tmp_path,
         # --- input: GOES ---
         ir_band13=band13.values.astype(np.float32),
         wv_band9=band9.values.astype(np.float32),
@@ -242,6 +278,23 @@ def export_training_example(
         **({"flash_density": np.asarray(result.diagnostics["flash_density"],
                                        dtype=np.float32)}
            if result.diagnostics.get("flash_density") is not None else {}),
+        # --- environment (0.160): ERA5 scalars from TC PRIMED's env file,
+        # at this overpass time. NaN where unavailable. Stored as 0-d
+        # float32 so a reader can tell "absent key" (pre-0.160 file) from
+        # "present but unknown" (NaN).
+        **{k: np.float32(v) for k, v in (env or {}).items()},
+        # Which GOES satellite the frame came from (0.160). Not recorded
+        # before; backfill_npz.py re-derives it with select_satellite().
+        goes_satellite=np.str_(getattr(band13, "satellite", "") or ""),
+        # The TC PRIMED overpass this example came from (0.162), so a
+        # resumed mine can skip it BEFORE fetching anything.
+        source_overpass=np.str_(source_overpass or ""),
+        # Which land mask made this example's coastline (0.166). Not yet in
+        # the physics ID, and datasets have been mined with the coarse
+        # cartopy 110m coastline (missing Guadeloupe, Barbados, Nassau, Key
+        # West, Grand Cayman) as well as the 1 km mask -- recorded so a
+        # mixed set is at least visible.
+        land_mask_backend=np.str_(_land_mask_backend()),
         vh_physics_id=np.str_(_vh_physics_id()),
         lat=result.lat.astype(np.float32),
         lon=result.lon.astype(np.float32),
@@ -277,6 +330,7 @@ def export_training_example(
         mw_sensor=diag["mw_sensor"],
         sensor_note=str(diag.get("calibration_source", "")),
     )
+    os.replace(tmp_path, path)
     return path
 
 

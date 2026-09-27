@@ -207,6 +207,24 @@ def _get_s3_client():
     return boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
 
+# Listing cache and parallel listing (0.162). A streaming run listed every
+# storm directory ONE AT A TIME (~0.17 s each, ~51 s for 301 storms) and
+# did it TWICE -- once for the pre-run estimate, once to mine. Past seasons
+# do not change within a run, so each directory is listed once per process.
+_LISTING_CACHE: dict = {}
+
+
+def list_overpass_files_many(storms, workers: int = 8) -> list:
+    """list_storm_overpass_files for each storm dict, in parallel, in
+    the same order."""
+    from concurrent.futures import ThreadPoolExecutor
+    def _one(st):
+        return list_storm_overpass_files(basin=st["basin"], storm_num=st["storm_num"],
+                                         season=st["season"])
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        return list(pool.map(_one, storms))
+
+
 def list_storm_overpass_files(
     basin: str,
     storm_num: int,
@@ -267,6 +285,21 @@ def list_storm_overpass_files(
     results.sort(key=lambda r: r["timestamp"])
     return results
 
+
+
+_list_storm_overpass_files_uncached = list_storm_overpass_files
+
+
+@__import__("functools").wraps(_list_storm_overpass_files_uncached)
+def list_storm_overpass_files(*args, **kwargs):   # noqa: F811 -- memoized
+    # functools.wraps keeps the real signature visible to inspect -- a test
+    # pins that the miner calls this with the parameters it really takes.
+    key = (args, tuple(sorted(kwargs.items())))
+    hit = _LISTING_CACHE.get(key)
+    if hit is None:
+        hit = _list_storm_overpass_files_uncached(*args, **kwargs)
+        _LISTING_CACHE[key] = hit
+    return hit
 
 def _parse_overpass_filename(filename: str) -> Optional[dict]:
     """Parse e.g. "TCPRIMED_v01r01-final_AL062018_GMI_GPM_025795_20180912184512.nc"

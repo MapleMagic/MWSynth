@@ -58,42 +58,49 @@ from typing import Optional
 BLOCK_SIZE = 512 * 1024
 
 # Cap on cached blocks per open file, so a large file cannot quietly grow
-# into the memory the rest of the pipeline needs. 16 blocks = 64 MB.
-# 128 blocks at 512 KB = 64 MB per open file. Only one file is open at a
-# time during mining, and this is well inside a 16 GB machine.
+# into the memory the rest of the pipeline needs: 128 blocks is 64 MB at
+# the 512 KB streaming size and 8 MB at the 64 KB ranged size.
 # Block size for a RANGED read of a slice, against the 512 KB used when
 # streaming a file end to end.
 #
-# 1 MB, and the reasoning that first produced 128 KB was WRONG. Recording
-# it because the error is instructive.
+# 64 KB, MEASURED against a live full-disk band in 0.157 -- and the two
+# earlier answers (128 KB, then 1 MB) were both reasoned from a storage
+# layout nobody had looked at.
 #
-# A live log showed a 0.64% crop fetching 9.4 MB in 18 requests, which
-# looked like 25x over-fetch against the 0.38 MB of pixels a crop
-# contains. I simulated the access as ~18 scattered 48 KB chunks, found
-# smaller blocks cut bytes, and shipped 128 KB.
+# 0.156 said: `Rad` is row-major and contiguous, so a 434-column crop is
+# 434 rows strided across a 4.7 MB span, ~5 MB is the floor, and 1 MB
+# blocks reach it fastest. The real file says otherwise:
 #
-# The next run measured 70 requests and 9.1 MB. The BYTES DID NOT DROP --
-# only the request count changed, inversely with block size. That can
-# only happen if the access is contiguous, and it is:
+#     Rad (5424, 5424) int16, CHUNKED 226x226, gzip 1 + shuffle,
+#     524 stored chunks, median 56 KB
 #
-#   the array is row-major and 5424 wide, so a 434-column crop reads 434
-#   separate rows 10848 bytes apart. The pixels total 0.38 MB, but they
-#   are strided across a CONTIGUOUS SPAN of 4.7 MB.
+# A 434x434 crop touches 9 chunks. Traced at the HDF5 level, the whole
+# crop -- Rad and DQF chunks, coordinates, metadata -- needs 0.58 MB in
+# 40 spans. 0.156 fetched 9.4-10.4 MB for it, for two reasons:
 #
-# So ~5 MB is the floor for this geometry and no block size beats it.
-# Smaller blocks cannot help; they only add round trips. Re-simulating
-# the true pattern -- 434 row-reads of 868 bytes:
+#   1. open_s3_hdf5 wrapped the reader in a 1 MiB BufferedReader. Every
+#      seek discards it, so each small HDF5 read refilled a full MiB.
+#      That alone inflated 0.58 MB of need to 6.9 MB of reads.
+#   2. Each ~56 KB chunk sits in a different 1 MB block.
 #
-#     block   requests   fetched   @50ms   @120ms
-#     128 KB        37   4.85 MB   2.39 s   4.98 s
-#     512 KB        10   5.24 MB   1.08 s   1.78 s
-#    1024 KB         5   5.24 MB   0.83 s   1.18 s
-#    2048 KB         3   6.29 MB   0.85 s   1.06 s
+# The chunks now arrive through prefetch() as exact ranges, in parallel,
+# so blocks serve only the ~10 small serial metadata reads HDF5 makes
+# (header, coordinates, B-tree nodes). Measured, pixels bit-identical:
 #
-# 1 MB reaches the byte floor in five requests and is fastest at both
-# latencies, so it beats the original 512 KB as well -- the change was
-# worth making, just in the opposite direction from the one I took.
-RANGED_BLOCK_SIZE = 1024 * 1024
+#     block      fetched   requests
+#     old path   10.44 MB        10   (1 MiB buffer + 1 MiB blocks)
+#      16 KB      0.76 MB        32
+#      64 KB      1.20 MB        29
+#     128 KB      1.79 MB        28
+#       1 MB     10.97 MB        28
+#
+# The serial round trips are ~10 in every row -- prefetch requests run
+# concurrently -- so smaller blocks buy bytes without buying latency,
+# until 16 KB starts splitting metadata reads. 64 KB: 8.7x fewer bytes.
+#
+# The lesson is the same one TC PRIMED taught in 0.121: open the real
+# file before modelling its access pattern.
+RANGED_BLOCK_SIZE = 64 * 1024
 
 MAX_CACHED_BLOCKS = 128
 
@@ -140,6 +147,10 @@ class S3RangeReader(io.RawIOBase):
         self._key = key
         self._pos = 0
         self._blocks: OrderedDict = OrderedDict()
+        # Exact byte spans fetched ahead of time by prefetch(): sorted
+        # starts, and start -> bytes. Consulted before the block cache.
+        self._span_starts: list = []
+        self._spans: dict = {}
         self.bytes_fetched = 0
         self.requests = 0
         self.bytes_served = 0
@@ -198,6 +209,11 @@ class S3RangeReader(io.RawIOBase):
         size = max(0, min(size, self._size - self._pos))
         if size == 0:
             return b""
+        hit = self._from_spans(self._pos, size)
+        if hit is not None:
+            self._pos += len(hit)
+            self.bytes_served += len(hit)
+            return hit
         out = bytearray()
         remaining, pos = size, self._pos
         while remaining > 0:
@@ -218,6 +234,76 @@ class S3RangeReader(io.RawIOBase):
         data = self.read(len(b))
         b[:len(data)] = data
         return len(data)
+
+    # --- exact-span prefetch -----------------------------------------
+    def prefetch(self, spans, max_workers: int = 16) -> int:
+        """Fetch exact byte spans IN PARALLEL, ahead of the reads that
+        will want them. Returns the number of bytes fetched.
+
+        Why this exists (measured in 0.157 against live S3): a 434x434
+        full-disk crop needs 0.58 MB -- nine 226x226 gzip chunks of Rad,
+        the matching DQF chunks, coordinates and metadata. Block reads
+        fetched 9.4 MB for it, because each ~56 KB chunk sits in a
+        different 1 MB block. Smaller blocks cut bytes but HDF5 issues
+        its reads SERIALLY, so every chunk became a round trip. Knowing
+        the crop bounds, the caller can ask the chunk index for each
+        chunk's exact offset and hand them all here at once: exact bytes,
+        one parallel wave of requests.
+
+        Overlapping or already-covered spans are skipped. A failed span is
+        simply left out; the normal block path serves it on demand.
+        """
+        if self._whole is not None:
+            return 0
+        todo = sorted({(int(o), int(n)) for o, n in spans
+                       if n and n > 0 and 0 <= o < self._size})
+        todo = [(o, min(n, self._size - o)) for o, n in todo
+                if self._from_spans(o, n, peek=True) is None]
+        if not todo:
+            return 0
+
+        def _get(span):
+            o, n = span
+            try:
+                resp = self._client.get_object(
+                    Bucket=self._bucket, Key=self._key,
+                    Range=f"bytes={o}-{o + n - 1}")
+                return o, resp["Body"].read()
+            except Exception:
+                return o, None
+
+        from concurrent.futures import ThreadPoolExecutor
+        import bisect
+        got = 0
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(todo)))) as pool:
+            for o, data in pool.map(_get, todo):
+                if not data:
+                    continue
+                self.requests += 1
+                self.bytes_fetched += len(data)
+                got += len(data)
+                if o not in self._spans:
+                    bisect.insort(self._span_starts, o)
+                self._spans[o] = data
+        return got
+
+    def _from_spans(self, pos: int, size: int, peek: bool = False):
+        """Bytes [pos, pos+size) if ONE prefetched span wholly contains
+        them, else None. HDF5 reads a chunk in a single call at its exact
+        offset, so the containing span is found by one bisect."""
+        if not self._span_starts:
+            return None
+        import bisect
+        i = bisect.bisect_right(self._span_starts, pos) - 1
+        if i < 0:
+            return None
+        start = self._span_starts[i]
+        data = self._spans[start]
+        if pos + size > start + len(data):
+            return None
+        if peek:
+            return b""
+        return data[pos - start:pos - start + size]
 
     # --- block cache --------------------------------------------------
     def _block(self, idx: int) -> bytes:
@@ -271,7 +357,13 @@ def open_s3_hdf5(client, bucket: str, key: str, size: Optional[int] = None,
 
     reader = S3RangeReader(client, bucket, key, size=size,
                            prefer_ranged=prefer_ranged)
-    # h5py needs a buffered wrapper: it does many small reads, and
-    # BufferedReader coalesces them before they reach the block cache.
-    buffered = io.BufferedReader(reader, buffer_size=1024 * 1024)
-    return h5py.File(buffered, "r"), reader
+    if reader._whole is not None:
+        # In memory already; the buffer is harmless and saves Python calls.
+        return h5py.File(io.BufferedReader(reader, buffer_size=1024 * 1024), "r"), reader
+    # RANGED: no BufferedReader. Measured in 0.157, a 1 MiB buffer here
+    # was the single largest source of over-fetch: every seek discards it,
+    # and the next small HDF5 read -- a 4 KB B-tree node or a 56 KB chunk
+    # -- refilled a full MiB from that position. On a real full-disk crop
+    # that turned 0.58 MB of need into 6.9 MB of reads BEFORE the block
+    # cache even saw them. The block cache already coalesces small reads.
+    return h5py.File(reader, "r"), reader

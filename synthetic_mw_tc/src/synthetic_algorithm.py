@@ -45,6 +45,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+import os
 import numpy as np
 import mw_surface as mw_surface_mod
 from scipy.ndimage import gaussian_filter, sobel
@@ -83,7 +84,7 @@ def _wrap_lon_delta(dlon):
 # dragging the fused 37 GHz eyewall radius from 26 km to 2 km. A stale
 # checkpoint cannot detect this about itself, so the backbone has to
 # announce its own identity and ml_inference has to check it.
-_VH_PHYSICS_BASE = "0.136"
+_VH_PHYSICS_BASE = "0.168"
 
 
 def _compute_vh_physics_id() -> str:
@@ -103,7 +104,29 @@ def _compute_vh_physics_id() -> str:
     """
     import hashlib
 
-    parts = [_VH_PHYSICS_BASE]
+    # Legacy mode reproduces the 0.136 ID exactly (no revision parts), so
+    # 0.136 data, checkpoints and replays keep matching it.
+    parts = [_VH_PHYSICS_BASE if USE_ADOPTED_CURVES else "0.136"]
+    # 0.168: the fitted curves and the coastline are physics too.
+    if USE_ADOPTED_CURVES:
+        parts.append("adopted=" + repr(ADOPTED_CURVE_KNOTS_KT)
+                     + repr(sorted((k, sorted(v.items())) for k, v in ADOPTED_CURVES.items())))
+        parts.append("land_mask=" + expected_land_mask())
+    if any(float(v) != 0.0 for v in DEPRESSION_INTENSITY_GAIN.values()):
+        parts.append("depression_gain=" + repr(sorted(DEPRESSION_INTENSITY_GAIN.items()))
+                     + repr(sorted(DEPRESSION_RAMP_KT.items())))
+    if any(float(v) != 0.0 for v in EMISSION_GAIN.values()):
+        parts.append("emission_gain=" + repr(sorted(EMISSION_GAIN.items())))
+    if any(float(v) != 0.0 for v in OUTER_DEPRESSION_GAIN.values()):
+        parts.append("outer_depression_gain=" + repr(sorted(OUTER_DEPRESSION_GAIN.items()))
+                     + repr(OUTER_RAMP_RMW))
+    if any(float(v) != 0.0 for v in FAR_DEPRESSION_GAIN.values()):
+        parts.append("far_depression_gain=" + repr(sorted(FAR_DEPRESSION_GAIN.items()))
+                     + repr(FAR_RAMP_RMW))
+    for _nm, _t in (("asym_emission_gain", ASYM_EMISSION_GAIN),
+                    ("asym_depression_gain", ASYM_DEPRESSION_GAIN)):
+        if any(float(v) != 0.0 for v in _t.values()):
+            parts.append(f"{_nm}=" + repr(sorted(_t.items())) + repr(ASYM_CENTRE_DEG))
     for k in sorted(CALIBRATION):
         v = CALIBRATION[k]
         if isinstance(v, (int, float)):
@@ -118,7 +141,7 @@ def _compute_vh_physics_id() -> str:
     except Exception:
         parts.append("mw_surface=unavailable")
     digest = hashlib.sha1("|".join(parts).encode()).hexdigest()[:10]
-    return f"{_VH_PHYSICS_BASE}-{digest}"
+    return f"{parts[0]}-{digest}"         # the base IN the hash, and before it
 #
 # Bumped for the accumulated backbone changes since 0.99, and above all
 # for 0.128: the stored backbone went from (parametric + per-frame
@@ -264,7 +287,7 @@ CALIBRATION = {
     # on the Generate tab once after updating -- the old learned offset was
     # calibrated against the previous (now-changed) baseline and is no
     # longer meaningful relative to this one.
-    "bg_v_37": 250.0,
+    "bg_v_37": 232.4,
     # Raised from 170 to 182: measured GMI 37H far-field ocean around this
     # storm was 182-193 K. (Calm-ocean 37H is nearer 150-160 K, but a
     # hurricane's outer wind field roughens the surface and raises H-pol
@@ -284,7 +307,7 @@ CALIBRATION = {
     # storm-relative EXCESS above that ambient, which is the part that
     # genuinely varies with radius. A real atmospheric term would be the
     # next improvement and would let this be decomposed properly.
-    "bg_h_37": 182.0,
+    "bg_h_37": 181.0,
     # Retuned so a saturated eyewall reaches the measured real values:
     # H37 182 -> ~275 K and V37 250 -> ~278 K, which collapses the
     # polarization difference from 68 K to about 3 K. That collapse is
@@ -293,8 +316,8 @@ CALIBRATION = {
     # in the NRL composite. The old 55/85 pair could only close V-H by
     # 30 K even at full emission, and the shared scattering fraction
     # then throttled that to about 6 K.
-    "emission_boost_v37": 28.0,
-    "emission_boost_h37": 93.0,
+    "emission_boost_v37": 28.2,
+    "emission_boost_h37": 69.7,
     # ASYMMETRIC depression -- V drops much more than H (physically:
     # ice scattering pulls both toward a similar cold floor, and V starts
     # higher so it has further to fall; H is already closer to that floor).
@@ -312,8 +335,8 @@ CALIBRATION = {
     # realistic response range (~0.4 to ~0.64 peak), not an abrupt jump.
     # Small at 37 GHz: ice scattering is weak there, and these now only
     # bite in the coldest overshooting tops (see vh_scatter_warm_bound_37).
-    "max_depression_v37": 20.0,
-    "max_depression_h37": 12.0,
+    "max_depression_v37": 31.7,
+    "max_depression_h37": 34.6,
 
 # --- Land background (see surface_type.py) --------------------------
     # Land at 37/89 GHz is a near-blackbody in BOTH polarizations
@@ -334,8 +357,8 @@ CALIBRATION = {
     "bg_h_37_land": 282.0,
     "bg_v_89_land": 290.0,
     "bg_h_89_land": 285.0,
-    "bg_v_89": 280.0,
-    "bg_h_89": 260.0,
+    "bg_v_89": 275.3,
+    "bg_h_89": 260.5,
 # 89 GHz EMISSION (0.133). Until now 89 GHz had no emission term at
     # all -- it was pure depression from a fixed background, monotonically
     # decreasing in response. That is wrong in the same way 37 GHz was
@@ -357,10 +380,10 @@ CALIBRATION = {
     # over ocean the background already sits close to saturation, so
     # there is very little room to rise. The term is real but weak, and
     # the resulting hook is a few K rather than a prominent bump.
-    "emission_boost_v89": 5.0,
-    "emission_boost_h89": 12.0,
-    "max_depression_v89": 130.0,
-    "max_depression_h89": 150.0,
+    "emission_boost_v89": 0.6,
+    "emission_boost_h89": 6.6,
+    "max_depression_v89": 105.5,
+    "max_depression_h89": 105.5,
 }
 
 
@@ -676,22 +699,41 @@ def _regrid_external_with_mask(src_lat, src_lon, src_values, dst_lat, dst_lon, m
     Returns an array shaped like dst_lat, with NaN where no source data
     was close enough to trust.
     """
-    from scipy.spatial import cKDTree
-
     src_points = np.column_stack([np.ravel(src_lat), np.ravel(src_lon)])
     values = np.ravel(src_values).astype(np.float64)
     valid_src = np.isfinite(values) & np.isfinite(src_points).all(axis=1)
-    src_points = src_points[valid_src]
+    src_points = np.ascontiguousarray(src_points[valid_src])
     values = values[valid_src]
 
     if len(values) == 0:
         return np.full(dst_lat.shape, np.nan)
 
     dst_points = np.column_stack([dst_lat.ravel(), dst_lon.ravel()])
-    regridded = griddata(src_points, values, dst_points, method=method).reshape(dst_lat.shape)
+    # 0.162: the Delaunay triangulation, KD-tree and destination query
+    # depend only on the POINTS, and one frame regrids the same swath
+    # points up to six times (V and H of each frequency, twice over) --
+    # 78% of a frame's generation time. Each is now built once per distinct
+    # point set and reused: the SAME objects griddata builds internally, so
+    # results are bit-identical (verified on a real frame, every output).
+    tri, tree, dist_deg, nn_idx = _swath_geometry(src_points, dst_points,
+                                                  need_tri=(method == "linear"))
+    if method == "linear":
+        from scipy.interpolate import LinearNDInterpolator
+        # Evaluate only where the result survives the distance mask below:
+        # each point's value depends only on its own triangle, so the kept
+        # pixels are bit-identical and the rest were set to NaN anyway.
+        keep = (dist_deg * 111.0) <= max_distance_km
+        flat = np.full(dst_points.shape[0], np.nan)
+        if keep.any():
+            flat[keep] = LinearNDInterpolator(tri, values, fill_value=np.nan,
+                                              rescale=False)(dst_points[keep])
+        regridded = flat.reshape(dst_lat.shape)
+    elif method == "nearest":
+        # griddata's "nearest" IS this cKDTree query on these points.
+        regridded = values[nn_idx].reshape(dst_lat.shape).astype(np.float64)
+    else:
+        regridded = griddata(src_points, values, dst_points, method=method).reshape(dst_lat.shape)
 
-    tree = cKDTree(src_points)
-    dist_deg, _ = tree.query(dst_points)
     # Approximate degree->km conversion for a coarse validity mask -- not
     # precise (1 deg longitude != 1 deg latitude in km except at the
     # equator), but this only needs to be roughly right to decide "is
@@ -700,6 +742,51 @@ def _regrid_external_with_mask(src_lat, src_lon, src_values, dst_lat, dst_lon, m
 
     regridded[dist_km_approx > max_distance_km] = np.nan
     return regridded
+
+
+_GEOM_CACHE = None
+_GEOM_LOCK = None
+_GEOM_CACHE_MAX = 8
+
+
+def _swath_geometry(src_points, dst_points, need_tri: bool):
+    """(Delaunay or None, cKDTree, nearest distance, nearest index) for these
+    source and destination points, cached on their CONTENT (a hash of the
+    bytes), so equal point sets share and a changed array never does."""
+    import hashlib
+    import threading
+    from collections import OrderedDict
+    from scipy.spatial import cKDTree, Delaunay
+    global _GEOM_CACHE, _GEOM_LOCK
+    if _GEOM_CACHE is None:
+        _GEOM_CACHE, _GEOM_LOCK = OrderedDict(), threading.Lock()
+    h = hashlib.blake2b(digest_size=20)
+    h.update(np.asarray(src_points.shape, dtype=np.int64).tobytes())
+    h.update(src_points.tobytes())
+    h.update(np.asarray(dst_points.shape, dtype=np.int64).tobytes())
+    h.update(np.ascontiguousarray(dst_points).tobytes())
+    key = h.digest()
+    with _GEOM_LOCK:
+        hit = _GEOM_CACHE.get(key)
+        if hit is not None:
+            _GEOM_CACHE.move_to_end(key)
+    if hit is not None and (hit[0] is not None or not need_tri):
+        return hit
+    if hit is not None:
+        tri, tree, dist_deg, nn_idx = hit
+    else:
+        tri = None
+        tree = cKDTree(src_points)
+        dist_deg, nn_idx = tree.query(dst_points)
+    if need_tri and tri is None:
+        tri = Delaunay(src_points)
+    entry = (tri, tree, dist_deg, nn_idx)
+    with _GEOM_LOCK:
+        _GEOM_CACHE[key] = entry
+        _GEOM_CACHE.move_to_end(key)
+        while len(_GEOM_CACHE) > _GEOM_CACHE_MAX:
+            _GEOM_CACHE.popitem(last=False)
+    return entry
 
 
 def _regrid_confidence_taper(site_lat, site_lon, dst_lat, dst_lon, taper_start_km, taper_end_km):
@@ -811,6 +898,152 @@ TEXTURE_FIELD_CLIP = 3.0
 # data calibration" caveat as the rest of CALIBRATION; tune here if the
 # backbone still reads as too smooth or, in the other direction, too
 # noisy once compared against more real passes.
+# Intensity gain on the scattering-depression amplitude (0.163). The
+# depression becomes cal[max_depression_c] * (1 + GAIN[c] * ramp(vmax)),
+# ramp rising 0 -> 1 across RAMP_KT[frequency]. All gains 0 = the physics
+# as fitted, bit-identical; they enter the physics ID only once nonzero.
+DEPRESSION_INTENSITY_GAIN = {"v37": 0.0, "h37": 0.0, "v89": 0.0, "h89": 0.0}
+DEPRESSION_RAMP_KT = {37: (30.0, 45.0), 89: (34.0, 130.0)}
+
+
+def _land_mask_backend_name() -> str:
+    try:
+        return surface_type.backend_name()
+    except Exception:
+        return ""
+
+
+def depression_gain(channel: str, vmax_kt) -> float:
+    """1 + gain * ramp(vmax): the multiplier on a channel's depression."""
+    g = float(DEPRESSION_INTENSITY_GAIN.get(channel, 0.0))
+    if g == 0.0 or vmax_kt is None or not np.isfinite(vmax_kt):
+        return 1.0
+    lo, hi = DEPRESSION_RAMP_KT[37 if channel.endswith("37") else 89]
+    return 1.0 + g * float(np.clip((float(vmax_kt) - lo) / (hi - lo), 0.0, 1.0))
+
+
+# 0.166 levers (see generate_synthetic_mw). All zero = the fitted physics.
+EMISSION_GAIN = {"v37": 0.0, "h37": 0.0, "v89": 0.0, "h89": 0.0}
+OUTER_DEPRESSION_GAIN = {"v37": 0.0, "h37": 0.0, "v89": 0.0, "h89": 0.0}
+OUTER_RAMP_RMW = (1.5, 2.5)
+
+
+# --- Physics revision 0.168: fitted by offline replay -----------------------
+# From the 0.167 sweep over 1,644 examples / 300 storms (zone-balanced,
+# ocean pixels, bounded least squares; knots piecewise-linear in Vmax, flat
+# beyond the ends). Adopted only where the two halves of the storms agreed
+# and the out-of-sample score improved; see CHANGELOG 0.168. The offset
+# lever is NOT adopted (it stands in for missing broad scattering in
+# intense storms -- the next question, not something to hide).
+#   37 GHz: no scattering depression (-1), none in the outer bands (-1),
+#           small emission changes, emission shifted downshear-left.
+#   89 GHz: outer-band (1.5-2.5 RMW) and far (3.5-5 RMW) scattering well
+#           above the fitted amplitude, tapering with intensity; h89
+#           emission off (-1); scattering shifted downshear-left.
+ADOPTED_CURVE_KNOTS_KT = (20.0, 45.0, 70.0, 95.0, 125.0)
+ADOPTED_CURVES = {
+    "dep": {"v37": (-1.00, -1.00, -1.00, -0.96, -0.91), "h37": (-1.00, -1.00, -1.00, -0.99, -0.98),
+            "v89": (0.52, -0.16, -0.43, 0.09, 0.34), "h89": (0.33, -0.16, -0.38, 0.26, 0.66)},
+    "em": {"v37": (0.16, -0.17, -0.04, 0.21, 0.12), "h37": (-0.02, -0.18, -0.08, 0.07, -0.01),
+           "h89": (-1.00, -1.00, -1.00, -1.00, -1.00)},
+    "out": {"v37": (-1.00, -1.00, -1.00, -0.98, -0.96), "h37": (-1.00, -1.00, -1.00, -1.00, -1.00),
+            "v89": (3.00, 1.91, 1.05, 0.98, 0.98), "h89": (2.89, 1.72, 0.93, 0.94, 1.01)},
+    "far": {"v89": (3.00, 3.00, 2.82, 1.78, 0.49), "h89": (3.00, 3.00, 2.67, 1.51, 0.20)},
+    "aem": {"v37": (0.04, 0.24, 0.36, 0.19, 0.16), "h37": (0.07, 0.26, 0.38, 0.21, 0.20)},
+    "adep": {"v89": (0.07, 0.31, 0.37, 0.36, 0.37), "h89": (0.05, 0.34, 0.42, 0.40, 0.40)},
+}
+# Replay and tests switch this off to reach the 0.136 physics the curves
+# were fitted against; production always runs with it on.
+# MWSYNTH_PHYSICS=0.136 selects the pre-revision physics everywhere,
+# including spawned worker processes (which inherit the environment, not
+# module state) -- used to replay or sweep examples mined under 0.136.
+USE_ADOPTED_CURVES = os.environ.get("MWSYNTH_PHYSICS", "").strip() != "0.136"
+
+
+def _lever_active(*gain_tables) -> bool:
+    """Whether a spatial weight is needed: always under the adopted physics,
+    otherwise only if a sweep hook in one of these tables is nonzero."""
+    return USE_ADOPTED_CURVES or any(float(v) != 0.0 for t in gain_tables for v in t.values())
+
+
+def adopted_gain(lever: str, channel: str, vmax_kt) -> float:
+    """The 0.168 gain for one lever and channel at this intensity."""
+    if not USE_ADOPTED_CURVES:
+        return 0.0
+    vals = ADOPTED_CURVES.get(lever, {}).get(channel)
+    if vals is None or vmax_kt is None or not np.isfinite(vmax_kt):
+        return 0.0
+    return float(np.interp(float(vmax_kt), ADOPTED_CURVE_KNOTS_KT, vals))
+
+
+def expected_land_mask() -> str:
+    """Which coastline this installation WILL use, without building or
+    loading anything (safe at import, including in spawned workers):
+    global_land_mask's 1 km data (as the packed copy or the package), else
+    cartopy's 1:110m Natural Earth, else none. Part of the physics ID from
+    0.168 -- the two coastlines differ by whole islands."""
+    import importlib.util
+    if importlib.util.find_spec("global_land_mask") is not None:
+        return "gl-1km"
+    if importlib.util.find_spec("cartopy") is not None:
+        return "cartopy-110m"
+    return "none"
+
+
+FAR_DEPRESSION_GAIN = {"v37": 0.0, "h37": 0.0, "v89": 0.0, "h89": 0.0}
+FAR_RAMP_RMW = (3.5, 5.0)
+ASYM_EMISSION_GAIN = {"v37": 0.0, "h37": 0.0, "v89": 0.0, "h89": 0.0}
+ASYM_DEPRESSION_GAIN = {"v37": 0.0, "h37": 0.0, "v89": 0.0, "h89": 0.0}
+# Centre of the downshear-left quadrant, clockwise from the downshear
+# heading -- the diagnostic's quadrants: DR 0-90, UR 90-180, UL 180-270,
+# DL 270-360 (Northern Hemisphere).
+ASYM_CENTRE_DEG = 315.0
+
+
+def _storm_offsets_km(lat, lon, storm_fix):
+    dy = (np.asarray(lat, dtype=np.float64) - storm_fix.lat) * 111.2
+    dx = (np.asarray(lon, dtype=np.float64) - storm_fix.lon) * 111.2 * np.cos(np.radians(storm_fix.lat))
+    return dx, dy
+
+
+def radial_ramp_weight(lat, lon, storm_fix, lo, hi) -> np.ndarray:
+    """0 inside lo x RMW, 1 beyond hi x RMW, linear between. Radius from the
+    best-track position -- the centre the diagnostic measures from; RMW
+    unknown -> 30 nm, as in the diagnostic."""
+    rmw_nm = storm_fix.rmw_nm if storm_fix.rmw_nm and np.isfinite(storm_fix.rmw_nm) else 30.0
+    dx, dy = _storm_offsets_km(lat, lon, storm_fix)
+    rr = np.hypot(dx, dy) / max(rmw_nm * 1.852, 5.0)
+    return np.clip((rr - lo) / (hi - lo), 0.0, 1.0)
+
+
+def outer_band_weight(lat, lon, storm_fix) -> np.ndarray:
+    """radial_ramp_weight over OUTER_RAMP_RMW."""
+    return radial_ramp_weight(lat, lon, storm_fix, *OUTER_RAMP_RMW)
+
+
+def shear_asymmetry_weight(lat, lon, storm_fix, env) -> np.ndarray:
+    """cos(angle from the downshear-left centre): +1 downshear-left, -1
+    upshear-right, 0 across. Zero everywhere when the deep-layer shear
+    heading is unknown (no ERA5 environment) -- no asymmetry invented."""
+    sdir = np.nan
+    if env:
+        try:
+            sdir = float(env.get("env_shear_deep_dir_deg", np.nan))
+        except (TypeError, ValueError):
+            sdir = np.nan
+    if not np.isfinite(sdir):
+        return 0.0
+    if storm_fix.lat < 0:
+        # Fitted on AL/EP/CP storms only. Whether the southern-hemisphere
+        # maximum is also downshear-left has not been measured here, so no
+        # asymmetry is invented for it.
+        return 0.0
+    dx, dy = _storm_offsets_km(lat, lon, storm_fix)
+    bearing = np.degrees(np.arctan2(dx, dy)) % 360.0
+    rel = (bearing - sdir) % 360.0
+    return np.cos(np.radians(rel - ASYM_CENTRE_DEG))
+
+
 TEXTURE_INJECTION_V37_K = 4.0
 TEXTURE_INJECTION_H37_K = 5.0
 TEXTURE_INJECTION_V89_K = 7.0
@@ -1133,6 +1366,9 @@ def generate_synthetic_mw(
     extra_ir: Optional[dict] = None,
     flash_density: Optional[np.ndarray] = None,
     progress_callback=None,
+    env: Optional[dict] = None,     # tcprimed_env.env_at() scalars (0.160)
+    psf_sensor: Optional[str] = None,   # override the PSF sensor (0.163, replay)
+    surface_override: Optional[dict] = None,   # stored land/elevation (0.164, replay)
 ) -> SyntheticMWResult:
     """Produce synthetic 37 GHz and 89 GHz Tb fields on band13's grid.
 
@@ -1589,6 +1825,15 @@ def generate_synthetic_mw(
     except Exception:
         land_frac = np.zeros_like(ir_tb, dtype=float)
         _surface_elevation = np.zeros_like(ir_tb, dtype=float)
+    # Replay (0.164): the land fraction and elevation a stored example was
+    # MADE with, installed AFTER the smoothing and clipping above -- which is
+    # the form export stores. Injecting them before that step smoothed them
+    # twice and made a faithful replay look worse than a recomputed one.
+    if surface_override is not None:
+        if surface_override.get("land_fraction") is not None:
+            land_frac = np.asarray(surface_override["land_fraction"], dtype=np.float64)
+        if surface_override.get("elevation_m") is not None:
+            _surface_elevation = np.asarray(surface_override["elevation_m"], dtype=np.float64)
 
     def _bg(name):
         """Ocean/land blended background for a CALIBRATION key."""
@@ -1651,19 +1896,55 @@ def generate_synthetic_mw(
     _sat37 = mw_surface.saturate(backbone_response_37)
     _sat89 = mw_surface.saturate(backbone_response_89)
 
-    v37_backbone = bg_v_37_f + cal["emission_boost_v37"] * _sat37 * (1 - scat_pot_vh_37) - cal["max_depression_v37"] * _sat37 * scat_pot_vh_37
-    h37_backbone = bg_h_37_f + cal["emission_boost_h37"] * _sat37 * (1 - scat_pot_vh_37) - cal["max_depression_h37"] * _sat37 * scat_pot_vh_37
+    # Intensity-dependent depression (0.163 hook, OFF by default). The 0.162
+    # diagnostic found the backbone too warm under deep convection by an
+    # amount that switches on near 34 kt at 37 GHz and grows steadily with
+    # intensity at 89 GHz, while the fitted amplitudes are intensity-free.
+    # Gains of zero reproduce the physics exactly; see depression_gain().
+    # 0.166: two more levers, same rules (off by default, exact physics at
+    # zero, in the physics ID only when nonzero): an EMISSION gain, and a
+    # depression gain weighted toward the OUTER bands (0 inside 1.5 RMW,
+    # 1 beyond 2.5) -- the 0.165 sweep showed extra depression acting in
+    # the cold-topped core, which was already right, while the 89 GHz
+    # deficit sits at 2-6 RMW.
+    # 0.167: a second radial ramp (FAR_RAMP_RMW) so the radial SHAPE of any
+    # extra depression can be fitted, and a shear-relative asymmetry weight
+    # (+1 downshear-left .. -1 upshear-right) for emission and depression.
+    _w_out = outer_band_weight(lat, lon, storm_fix) if _lever_active(OUTER_DEPRESSION_GAIN) else 0.0
+    _w_far = (radial_ramp_weight(lat, lon, storm_fix, *FAR_RAMP_RMW)
+              if _lever_active(FAR_DEPRESSION_GAIN) else 0.0)
+    _asym = (shear_asymmetry_weight(lat, lon, storm_fix, env)
+             if _lever_active(ASYM_EMISSION_GAIN, ASYM_DEPRESSION_GAIN) else 0.0)
+    # 0.168: every adjustment acts over OCEAN only, scaled by the ocean
+    # fraction. The 0.167 sweep fitted ocean pixels and showed the same
+    # gains making LAND pixels worse (h37 bands 19.8 -> 20.6 K, h89 outer
+    # 15.5 -> 16.6 K): land's surface emission is a different regime.
+    _ocean = np.clip(1.0 - np.asarray(land_frac, dtype=np.float64), 0.0, 1.0)
+    _v = storm_fix.vmax_kt
+    _dg = {c: 1.0 + _ocean * (
+               (depression_gain(c, _v) - 1.0)
+               + (float(OUTER_DEPRESSION_GAIN.get(c, 0.0)) + adopted_gain("out", c, _v)) * _w_out
+               + (float(FAR_DEPRESSION_GAIN.get(c, 0.0)) + adopted_gain("far", c, _v)) * _w_far
+               + (float(ASYM_DEPRESSION_GAIN.get(c, 0.0)) + adopted_gain("adep", c, _v)) * _asym
+               + adopted_gain("dep", c, _v))
+           for c in ("v37", "h37", "v89", "h89")}
+    _eg = {c: 1.0 + _ocean * (
+               float(EMISSION_GAIN.get(c, 0.0)) + adopted_gain("em", c, _v)
+               + (float(ASYM_EMISSION_GAIN.get(c, 0.0)) + adopted_gain("aem", c, _v)) * _asym)
+           for c in ("v37", "h37", "v89", "h89")}
+    v37_backbone = bg_v_37_f + cal["emission_boost_v37"] * _eg["v37"] * _sat37 * (1 - scat_pot_vh_37) - cal["max_depression_v37"] * _dg["v37"] * _sat37 * scat_pot_vh_37
+    h37_backbone = bg_h_37_f + cal["emission_boost_h37"] * _eg["h37"] * _sat37 * (1 - scat_pot_vh_37) - cal["max_depression_h37"] * _dg["h37"] * _sat37 * scat_pot_vh_37
     # 89 GHz now splits emission from scattering, exactly as 37 GHz does.
     # Ice depression is additionally scaled by latitude: the freezing
     # level drops poleward, so the same cloud top implies less ice aloft
     # at 35 degrees than in the deep tropics.
     _ice = mw_surface.ice_depth_factor(lat)
     v89_backbone = (bg_v_89_f
-                    + cal["emission_boost_v89"] * _sat89 * (1 - scat_pot_vh_89)
-                    - cal["max_depression_v89"] * _sat89 * scat_pot_vh_89 * _ice)
+                    + cal["emission_boost_v89"] * _eg["v89"] * _sat89 * (1 - scat_pot_vh_89)
+                    - cal["max_depression_v89"] * _dg["v89"] * _sat89 * scat_pot_vh_89 * _ice)
     h89_backbone = (bg_h_89_f
-                    + cal["emission_boost_h89"] * _sat89 * (1 - scat_pot_vh_89)
-                    - cal["max_depression_h89"] * _sat89 * scat_pot_vh_89 * _ice)
+                    + cal["emission_boost_h89"] * _eg["h89"] * _sat89 * (1 - scat_pot_vh_89)
+                    - cal["max_depression_h89"] * _dg["h89"] * _sat89 * scat_pot_vh_89 * _ice)
 
     # Backbone always fully covers the grid (goes_response has no NaN, and
     # _weighted_fuse guarantees full coverage wherever "goes" is valid) --
@@ -1737,6 +2018,7 @@ def generate_synthetic_mw(
             flash_density=flash_density,
             strength=ml_strength,
             stats_out=ml_stats,
+            env=env,
             progress_callback=progress_callback,
         )
         ml_delta = {
@@ -1750,8 +2032,16 @@ def generate_synthetic_mw(
         # patch fell entirely outside the grid," both count as "attempted
         # successfully" here; ml_inference's own progress_callback messages
         # carry the more specific detail when something is available to log to.
-    except Exception:
-        pass  # import failure or anything else -- same graceful no-op as ml_inference's own internal fallback
+    except Exception as _ml_e:
+        # Still a graceful no-op -- a frame without the ML correction is a
+        # valid frame -- but no longer a SILENT one (0.160). This was
+        # `except Exception: pass`, so any error here, including a wrong
+        # keyword argument, produced an uncorrected frame with nothing
+        # anywhere saying the correction had not happened.
+        ml_stats.setdefault("applied", False)
+        ml_stats["error"] = f"{type(_ml_e).__name__}: {_ml_e}"
+        if progress_callback:
+            progress_callback(f"  ML correction skipped ({type(_ml_e).__name__}: {_ml_e})")
 
     # --- Inject REAL GOES-derived spatial texture into the backbone ---
     #
@@ -1954,6 +2244,21 @@ def generate_synthetic_mw(
     h37_backbone = h37_backbone + floor_amp_h37 * footprint_noise
     v89_backbone = v89_backbone + floor_amp_v89 * footprint_noise
     h89_backbone = h89_backbone + floor_amp_h89 * footprint_noise
+    # 0.168 -- the texture leak. Where a real swath exists, the texture and
+    # floor amplitudes above are MEASURED from it, so the backbone carried
+    # texture scaled to the real answer, while every GOES-only frame uses the
+    # defaults. The display keeps it (it makes fused frames look right); the
+    # STORED training backbone must not. Both terms are linear and pass
+    # through the same sensor PSF, so the excess is subtracted exactly at
+    # export, as the baseline shift is (see "backbone_*" diagnostics).
+    _tex_excess = None
+    if any(m is not None for m in (measured_v37, measured_h37, measured_v89, measured_h89)):
+        _tex_excess = {
+            "v37": (tex_amp_v37 - TEXTURE_INJECTION_V37_K) * texture_field + (floor_amp_v37 - 2.0) * footprint_noise,
+            "h37": (tex_amp_h37 - TEXTURE_INJECTION_H37_K) * texture_field + (floor_amp_h37 - 2.5) * footprint_noise,
+            "v89": (tex_amp_v89 - TEXTURE_INJECTION_V89_K) * texture_field + (floor_amp_v89 - 1.8) * footprint_noise,
+            "h89": (tex_amp_h89 - TEXTURE_INJECTION_H89_K) * texture_field + (floor_amp_h89 - 2.2) * footprint_noise,
+        }
     # --- Sensor antenna pattern (0.112) -------------------------------
     # Applied to the BACKBONE ONLY, and before texture injection.
     #
@@ -1979,13 +2284,21 @@ def generate_synthetic_mw(
     # which no real sensor pair does.
     try:
         import mw_psf
-        psf_sensor = (real_swath.sensor if real_swath is not None
+        # An explicit sensor wins (0.163): offline replay rebuilds a stored
+        # example WITHOUT its swath, and must blur with the sensor that
+        # example was made for, not the default.
+        _psf_override = psf_sensor
+        psf_sensor = (_psf_override if _psf_override in mw_psf.SENSOR_IFOV_KM
+                      else real_swath.sensor if real_swath is not None
                       and getattr(real_swath, "sensor", None) in mw_psf.SENSOR_IFOV_KM
                       else mw_psf.DEFAULT_SENSOR)
         v37_backbone = mw_psf.apply_sensor_psf(v37_backbone, lat, lon, 37, psf_sensor)
         h37_backbone = mw_psf.apply_sensor_psf(h37_backbone, lat, lon, 37, psf_sensor)
         v89_backbone = mw_psf.apply_sensor_psf(v89_backbone, lat, lon, 89, psf_sensor)
         h89_backbone = mw_psf.apply_sensor_psf(h89_backbone, lat, lon, 89, psf_sensor)
+        if _tex_excess is not None:          # same blur as the backbone it was part of
+            _tex_excess = {c: mw_psf.apply_sensor_psf(f, lat, lon, 37 if c.endswith("37") else 89, psf_sensor)
+                           for c, f in _tex_excess.items()}
         if progress_callback:
             progress_callback(mw_psf.describe(lat, lon, psf_sensor))
     except Exception as e:
@@ -2281,6 +2594,11 @@ def generate_synthetic_mw(
             # Surface conditioning, recorded so training_data_export can
             # persist exactly what the model was conditioned on.
             "land_fraction": land_frac,
+            # Which land mask produced it (0.166): the 110m cartopy fallback
+            # misses Guadeloupe, Barbados, Nassau, Key West and Grand Cayman
+            # entirely, so data built with it must not silently mix with
+            # data built from the 1 km mask.
+            "land_mask_backend": _land_mask_backend_name(),
             # Supplementary IR bands already regridded onto this grid, so
             # the exporter stores precisely what the model was fed.
             "extra_ir_regridded": _extra_ir_grids,
@@ -2359,10 +2677,10 @@ def generate_synthetic_mw(
             # one a GOES-only frame actually produces. The residual target
             # grows accordingly, which is the point: the model should be
             # learning that systematic offset, not having it handed over.
-            "backbone_v37": v37_backbone - ml_delta["v37"] - baseline_shift_v37,
-            "backbone_h37": h37_backbone - ml_delta["h37"] - baseline_shift_h37,
-            "backbone_v89": v89_backbone - ml_delta["v89"] - baseline_shift_v89,
-            "backbone_h89": h89_backbone - ml_delta["h89"] - baseline_shift_h89,
+            "backbone_v37": v37_backbone - ml_delta["v37"] - baseline_shift_v37 - (_tex_excess["v37"] if _tex_excess else 0.0),
+            "backbone_h37": h37_backbone - ml_delta["h37"] - baseline_shift_h37 - (_tex_excess["h37"] if _tex_excess else 0.0),
+            "backbone_v89": v89_backbone - ml_delta["v89"] - baseline_shift_v89 - (_tex_excess["v89"] if _tex_excess else 0.0),
+            "backbone_h89": h89_backbone - ml_delta["h89"] - baseline_shift_h89 - (_tex_excess["h89"] if _tex_excess else 0.0),
             # Recorded so the effect is auditable rather than implicit.
             "baseline_shift_k": {"v37": baseline_shift_v37, "h37": baseline_shift_h37,
                                  "v89": baseline_shift_v89, "h89": baseline_shift_h89},

@@ -46,7 +46,7 @@ def _centered_patch(arr, center_rc, ps):
 
 
 def diagnose(data_dir: str = DEFAULT_DATA_DIR, max_files: int = 10):
-    files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+    files = __import__("training_data_export").list_training_files(data_dir)
     if not files:
         print(f"No .npz files found in {data_dir}")
         return

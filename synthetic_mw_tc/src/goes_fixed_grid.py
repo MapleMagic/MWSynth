@@ -178,8 +178,34 @@ def estimate_crop_fraction(bounds, x_len: int, y_len: int) -> float:
 
 # --- Reading a crop out of a full-disk / CONUS file -------------------
 
+def crop_chunk_spans(ds, y0: int, y1: int, x0: int, x1: int):
+    """Exact (byte_offset, size) of every stored chunk of 2-D dataset `ds`
+    that the slice [y0:y1, x0:x1] touches, or [] if that cannot be known
+    (contiguous layout, or an h5py without the chunk-index API).
+
+    Unallocated chunks -- full-disk space pixels are never written --
+    report no offset and are skipped; HDF5 fills them without a read.
+    """
+    try:
+        chunks = ds.chunks
+        if not chunks or len(chunks) != 2:
+            return []
+        cy, cx = chunks
+        dsid = ds.id
+        spans = []
+        for oy in range((y0 // cy) * cy, y1, cy):
+            for ox in range((x0 // cx) * cx, x1, cx):
+                info = dsid.get_chunk_info_by_coord((oy, ox))
+                if info.byte_offset is not None and info.size:
+                    spans.append((int(info.byte_offset), int(info.size)))
+        return spans
+    except Exception:
+        return []
+
+
 def read_cropped_radiance(h5, center_lat: float, center_lon: float,
-                          sat_lon: float, half_width_km: float = 512.0):
+                          sat_lon: float, half_width_km: float = 512.0,
+                          prefetch=None):
     """Read a storm-centred crop of `Rad` from an OPEN ABI L1b file.
 
     Takes an already-open h5py-like handle rather than a path, for the
@@ -207,6 +233,18 @@ def read_cropped_radiance(h5, center_lat: float, center_lon: float,
     y0, y1, x0, x1 = bounds
 
     rad_ds = h5["Rad"]
+    if prefetch is not None:
+        # Hand every chunk this crop touches -- Rad and DQF -- to the
+        # reader in ONE call, so they arrive as one parallel wave of exact
+        # ranges instead of HDF5 pulling them serially through blocks.
+        spans = crop_chunk_spans(rad_ds, y0, y1, x0, x1)
+        if "DQF" in _keys(h5):
+            spans += crop_chunk_spans(h5["DQF"], y0, y1, x0, x1)
+        if spans:
+            try:
+                prefetch(spans)
+            except Exception:
+                pass    # an optimisation only; the demand path still works
     # THE slice that matters: HDF5 reads only the chunks this touches.
     raw = np.asarray(rad_ds[y0:y1, x0:x1], dtype=np.float64)
 

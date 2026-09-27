@@ -90,7 +90,7 @@ def _accumulate_flashes(satellite: str, target_time, progress_callback=None):
                      target_time + timedelta(minutes=ACCUM_MINUTES))
     except Exception as e:
         if progress_callback:
-            progress_callback(f"GLM unavailable ({type(e).__name__}) -- "
+            progress_callback(f"GLM unavailable ({type(e).__name__}: {e}) -- "
                               f"lightning channel will be empty.")
         return None
 
@@ -113,7 +113,19 @@ def flash_density_grid(lat, lon, satellite: str, target_time,
     if flashes is None:
         return out
     flat, flon = np.asarray(flashes[0]), np.asarray(flashes[1])
-    if flat.size == 0:
+    # ALWAYS say how many flashes the whole disk returned, not just the
+    # count inside the grid. The two all-zero cases look identical in the
+    # output -- a genuinely lightning-free oceanic core (common: 0.157's
+    # live run had Beryl and Ernesto at 2 and 0 flashes against ~1,600-
+    # 1,900 on the disk) and a fetch that silently returned nothing -- and
+    # only the disk-wide count separates them. A working +/-5 min fetch is
+    # essentially never zero across a hemisphere.
+    n_disk = int(flat.size)
+    if n_disk == 0:
+        if progress_callback:
+            progress_callback("GLM: 0 flashes on the WHOLE DISK in the window -- "
+                              "almost certainly a fetch problem, not a quiet "
+                              "scene; lightning channel will be empty.")
         return out
 
     # Bin onto the grid by nearest cell. The grid is a smoothly varying
@@ -124,6 +136,10 @@ def flash_density_grid(lat, lon, satellite: str, target_time,
     rows, cols = lat.shape
     inside = ((flat >= lat0) & (flat <= lat1) & (flon >= lon0) & (flon <= lon1))
     if not inside.any():
+        if progress_callback:
+            progress_callback(f"GLM: 0 of {n_disk} disk flash(es) inside the grid "
+                              f"in +/-{ACCUM_MINUTES:.0f} min -- a quiet scene, "
+                              f"fetch healthy.")
         return out
     # Rows follow decreasing latitude in this project's grids; derive the
     # direction from the data rather than assuming it.
@@ -147,7 +163,7 @@ def flash_density_grid(lat, lon, satellite: str, target_time,
 
     if progress_callback:
         n = int(inside.sum())
-        progress_callback(f"GLM: {n} flash(es) in +/-{ACCUM_MINUTES:.0f} min, "
+        progress_callback(f"GLM: {n} of {n_disk} disk flash(es) in +/-{ACCUM_MINUTES:.0f} min, "
                           f"peak density {out.max():.3f}/cell")
     return out.astype(np.float32)
 

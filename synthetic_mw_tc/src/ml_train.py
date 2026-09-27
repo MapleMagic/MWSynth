@@ -30,11 +30,13 @@ DESIGN NOTES:
 from __future__ import annotations
 
 import glob
+from training_data_export import list_training_files as tde_list_training_files
 import os
 import random
 from datetime import datetime
 
 import numpy as np
+import copy
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -44,7 +46,8 @@ import ml_diffusion
 from ml_constants import CORRECTION_ARCH, DIFFUSION_BASE_CHANNELS
 from ml_constants import (normalize_channel, TB_MEAN, TB_STD, VMAX_MEAN, VMAX_STD, RMW_MEAN, RMW_STD, PATCH_SIZE,
                           PATCH_SAMPLE_STRIDE, PATCH_FOOTPRINT_PX, MODEL_EXTRA_IR_BANDS,
-                          ELEV_MEAN, ELEV_STD, MODEL_IN_CHANNELS)
+                          ELEV_MEAN, ELEV_STD, MODEL_IN_CHANNELS,
+                          ENV_CHANNELS, ENV_DROPOUT_P)
 from mw_composites import COLOR_RED_THETA
 
 def _wrap_lon_delta(dlon):
@@ -66,6 +69,19 @@ PCT_LOSS_WEIGHT = 0.5
 # Probability of zeroing the vmax/RMW conditioning layers for a training
 # sample. See MWCorrectionDataset for the reasoning.
 SCALAR_DROPOUT_P = 0.25
+
+# --- Trustworthy selection (0.169) --------------------------------------------
+# 0.168's first full training scored sampled skill on the first 4 validation
+# batches with fresh diffusion draws every epoch: it swung +0.21 -> -0.10 ->
+# +0.18 while the validation loss fell smoothly, chose a lucky early epoch,
+# and stopped the run at epoch 17 with the loss still improving. Now:
+EVAL_SUBSET_SIZE = 96           # fixed, intensity-stratified validation examples
+EVAL_SEED = 1234                # identical diffusion draws every epoch
+EVAL_MEMBERS = 4
+FINAL_EVAL_MEMBERS = 8          # full validation set, once, at the end
+MIN_EPOCHS_BEFORE_STOP = 20
+USE_EMA = True                  # evaluate and save an exponential moving average
+EMA_DECAY = 0.999               # of the weights (standard for diffusion models)
 
 # Mirror (left-right flip) augmentation. OFF by default: it reverses a
 # cyclone's rotational handedness, and since SH basins are excluded from
@@ -169,6 +185,8 @@ class MWCorrectionDataset(Dataset):
         # best-track RMW is genuinely missing -- rather than an
         # out-of-distribution sentinel.
         self.scalar_dropout = scalar_dropout
+        # Environment withheld at random in TRAINING only (0.160).
+        self.env_dropout = ENV_DROPOUT_P if scalar_dropout > 0.0 else 0.0
 
     def __len__(self):
         return len(self.file_paths)
@@ -347,7 +365,8 @@ class MWCorrectionDataset(Dataset):
              vmax_layer, rmw_layer,
              _surface("land_fraction", 0.0, 1.0),
              _surface("elevation_m", ELEV_MEAN, ELEV_STD),
-             _flash_channel(data, _extract, neutral)],
+             _flash_channel(data, _extract, neutral),
+             *_env_layers(data, ps, self.env_dropout)],
             axis=0,
         )
         # Any remaining NaN in the INPUT (e.g. backbone at a masked-out
@@ -363,7 +382,101 @@ class MWCorrectionDataset(Dataset):
             # value -- used only to bucket validation loss by intensity
             # band, never fed to the model.
             torch.tensor(storm_vmax_kt, dtype=torch.float32),
+            # r / RMW per patch pixel (0.162) -- scoring only, never an
+            # input. Cut with the SAME _extract as every input, so it
+            # lines up pixel for pixel. Validation only (no augmentation to
+            # mirror); training returns zeros it never reads.
+            torch.from_numpy(self._r_over_rmw(_extract, lat, lon, storm_lat, storm_lon,
+                                              storm_rmw_nm, ps)),
         )
+
+    def _r_over_rmw(self, _extract, lat, lon, storm_lat, storm_lon, rmw_nm, ps):
+        if self.augment:
+            return np.zeros((ps, ps), dtype=np.float32)
+        la = _extract(np.asarray(lat, dtype=np.float64))
+        lo = _extract(np.asarray(lon, dtype=np.float64))
+        dy = (la - storm_lat) * 111.2
+        dx = (lo - storm_lon) * 111.2 * np.cos(np.radians(storm_lat))
+        rr = np.hypot(dx, dy) / max(float(rmw_nm) * 1.852, 5.0)
+        out = np.full((ps, ps), np.inf, dtype=np.float32)
+        h, w = min(ps, rr.shape[0]), min(ps, rr.shape[1])
+        out[:h, :w] = rr[:h, :w]
+        return out
+
+
+def _env_layers(data, ps, dropout_p):
+    """Constant planes for ml_constants.ENV_CHANNELS. Withheld at random
+    (dropout_p) so the model also learns the no-environment case it will
+    meet on every live storm."""
+    import tcprimed_env
+    names = getattr(data, "files", ())
+    env = {k: float(data[k]) for k in tcprimed_env.ENV_KEYS if k in names}
+    if dropout_p > 0.0 and random.random() < dropout_p:
+        env = None
+    vals = tcprimed_env.encode_env(env)
+    return [np.full((ps, ps), v, dtype=np.float32) for v in vals]
+
+
+# Regime oversampling (plan #19, 0.162). Rapid intensification and strong
+# shear are a small share of any mine, and the atypical case -- a core
+# intensifying UNDER shear -- is a small share of that. Weighted sampling
+# shows the model those regimes more often without duplicating files.
+# PAST 24 h change only, like every other use of intensity change here.
+REGIME_WEIGHTING = True
+RI_PAST24_KT = 30.0
+RI_WEIGHT = 3.0
+HIGH_SHEAR_MS = 10.0
+HIGH_SHEAR_WEIGHT = 2.0
+REGIME_WEIGHT_CAP = 4.0
+
+
+def regime_weights(files):
+    """(weights or None, one-line report). None when switched off or when
+    fewer than half the files carry the environment -- weighting on NaNs
+    would just be weighting on which files happen to be newer."""
+    if not REGIME_WEIGHTING or not files:
+        return None, "Regime weighting: off"
+    w, n_env, n_ri, n_sh = [], 0, 0, 0
+    for f in files:
+        wt = 1.0
+        try:
+            with np.load(f) as z:
+                if "env_shear_deep_ms" in z.files:
+                    n_env += 1
+                    dv = float(z["env_dvmax_past24_kt"])
+                    sh = float(z["env_shear_deep_ms"])
+                    if np.isfinite(dv) and dv >= RI_PAST24_KT:
+                        wt *= RI_WEIGHT
+                        n_ri += 1
+                    if np.isfinite(sh) and sh >= HIGH_SHEAR_MS:
+                        wt *= HIGH_SHEAR_WEIGHT
+                        n_sh += 1
+        except Exception:
+            pass
+        w.append(min(wt, REGIME_WEIGHT_CAP))
+    if n_env < 0.5 * len(files):
+        return None, (f"Regime weighting: off -- only {n_env}/{len(files)} examples carry "
+                      f"the ERA5 environment (run backfill_npz.py)")
+    w = np.asarray(w, dtype=np.float64)
+    share = lambda mask: float(w[mask].sum() / w.sum()) if w.sum() else 0.0
+    return w.tolist(), (f"Regime weighting: {n_ri} past-RI (>= +{RI_PAST24_KT:.0f} kt/24 h) and "
+                        f"{n_sh} high-shear (>= {HIGH_SHEAR_MS:.0f} m/s) of {len(files)} examples; "
+                        f"weighted share drawn: {share(w > 1.0):.0%} (unweighted "
+                        f"{float((w > 1.0).mean()):.0%})")
+
+
+def env_coverage(files) -> float:
+    """Fraction of `files` carrying the ERA5 environment."""
+    if not files:
+        return 0.0
+    n = 0
+    for f in files:
+        try:
+            with np.load(f) as z:
+                n += "env_shear_deep_ms" in z.files
+        except Exception:
+            pass
+    return n / len(files)
 
 
 def learning_curve_storm_subsets(data_dir: str = DEFAULT_DATA_DIR,
@@ -403,6 +516,24 @@ def learning_curve_storm_subsets(data_dir: str = DEFAULT_DATA_DIR,
     return out
 
 
+def extra_ir_coverage(files) -> dict:
+    """{band: fraction of `files` whose NPZ holds real data for it}.
+    Reads only each archive's member list, not the arrays."""
+    if not files:
+        return {}
+    counts = {b: 0 for b in MODEL_EXTRA_IR_BANDS}
+    for f in files:
+        try:
+            with np.load(f) as z:
+                names = set(z.files)
+        except Exception:
+            continue
+        for b in counts:
+            if f"ir_band{b}" in names:
+                counts[b] += 1
+    return {b: n / len(files) for b, n in counts.items()}
+
+
 def make_train_val_split(data_dir: str = DEFAULT_DATA_DIR, val_fraction: float = 0.15, seed: int = 42) -> tuple:
     """Splits by STORM ID (parsed from each filename's leading segment,
     see training_data_export.py's naming convention), not by individual
@@ -424,7 +555,7 @@ def make_train_val_split(data_dir: str = DEFAULT_DATA_DIR, val_fraction: float =
     Falls back to the old unstratified shuffle if intensities can't be
     read -- a split is better than no split.
     """
-    files = sorted(glob.glob(os.path.join(data_dir, "*.npz")))
+    files = tde_list_training_files(data_dir)
     storms = sorted(set(os.path.basename(f).split("_")[0] for f in files))
 
     rng = random.Random(seed)
@@ -519,7 +650,7 @@ def _storm_peak_vmax(data_dir: str) -> dict:
     storm_vmax_kt scalar from each .npz. npz is a zip archive, so pulling
     one small array does not decompress the image stacks."""
     peaks = {}
-    for f in sorted(glob.glob(os.path.join(data_dir, "*.npz"))):
+    for f in tde_list_training_files(data_dir):
         storm = os.path.basename(f).split("_")[0]
         try:
             with np.load(f, allow_pickle=True) as d:
@@ -591,7 +722,61 @@ def crps_ensemble(members_k, truth_k, mask=None):
     return accuracy - 0.5 * spread
 
 
-def sampled_skill(model, loader, device, steps=16, members=4, max_batches=4):
+# r/RMW bins for skill by radius (0.162): inner core, eyewall/near core,
+# inner bands, outer region.
+RADIUS_BINS = ((0.0, 1.0), (1.0, 2.0), (2.0, 4.0), (4.0, float("inf")))
+
+
+def stratified_eval_subset(files, n):
+    """A fixed, deterministic subset of `files` spread across intensity:
+    sorted by Vmax (then name) and taken at even steps, so every band is
+    represented in proportion and the subset is identical every epoch."""
+    if len(files) <= n:
+        return list(files)
+    keyed = []
+    for f in files:
+        try:
+            with np.load(f) as z:
+                keyed.append((float(z["storm_vmax_kt"]), os.path.basename(f), f))
+        except Exception:
+            keyed.append((0.0, os.path.basename(f), f))
+    keyed.sort()
+    step = len(keyed) / float(n)
+    return [keyed[int(i * step)][2] for i in range(n)]
+
+
+def final_selection(base_model, val_loader, device, checkpoint_dir, best_epochs):
+    """Score the best-by-skill and best-by-loss checkpoints on the FULL
+    validation set (FINAL_EVAL_MEMBERS, seeded) and make the better one the
+    default. The per-epoch number only has to rank epochs; this one decides."""
+    import shutil
+    paths = {"skill": os.path.join(checkpoint_dir, "mw_correction_best.pt"),
+             "loss": os.path.join(checkpoint_dir, "mw_correction_best_loss.pt")}
+    scores = {}
+    for k, pth in paths.items():
+        if not os.path.exists(pth):
+            continue
+        m = copy.deepcopy(base_model).to(device).eval()
+        ck = torch.load(pth, map_location=device, weights_only=False)
+        m.load_state_dict({kk.replace("_orig_mod.", ""): v for kk, v in ck["model_state_dict"].items()})
+        sk = sampled_skill(m, val_loader, device, members=FINAL_EVAL_MEMBERS, seed=EVAL_SEED)
+        if sk:
+            scores[k] = (sk["skill"], sk.get("crps_k"), ck.get("epoch"))
+    if not scores:
+        return
+    print(f"\nFinal check on the FULL validation set ({FINAL_EVAL_MEMBERS} members, seeded):")
+    for k, (skill, crps, ep) in scores.items():
+        print(f"  best by {k:5s} (epoch {ep + 1 if ep is not None else '?'}): skill {skill:+.3f}"
+              + (f", CRPS {crps:.2f} K" if crps is not None and np.isfinite(crps) else ""))
+    if "loss" in scores and "skill" in scores and scores["loss"][0] > scores["skill"][0]:
+        shutil.copyfile(paths["loss"], paths["skill"])
+        print("  -> the best-by-LOSS checkpoint scores better on the full set; it is now "
+              "the default (mw_correction_best.pt)")
+    else:
+        print("  -> keeping the best-by-skill checkpoint as the default")
+
+
+def sampled_skill(model, loader, device, steps=16, members=4, max_batches=None, seed=None):
     """Sample residuals and score them against the DO-NOTHING baseline.
 
     WHY THIS IS NECESSARY: the flow-matching loss is not interpretable on
@@ -619,13 +804,22 @@ def sampled_skill(model, loader, device, steps=16, members=4, max_batches=4):
 
     model.eval()
     se_model = se_zero = n_px = spread_sum = se_member = 0.0
+    # Skill by r/RMW (plan #10, 0.162): all channels, and h37 alone.
+    rb = {("all", b): [0.0, 0.0, 0.0] for b in range(len(RADIUS_BINS))}
+    rb.update({("h37", b): [0.0, 0.0, 0.0] for b in range(len(RADIUS_BINS))})
     crps_sum = crps_px = 0.0
     se_offset = 0.0
     with torch.no_grad():
-        for bi, (inputs, targets, masks, _v) in enumerate(loader):
-            if bi >= max_batches:
+        for bi, (inputs, targets, masks, _v, rr) in enumerate(loader):
+            if max_batches is not None and bi >= max_batches:
                 break
             inputs, targets, masks = inputs.to(device), targets.to(device), masks.to(device)
+            gen = None
+            if seed is not None:
+                # Same draws every call (per batch), without touching the
+                # global RNG that training uses.
+                gen = torch.Generator(device=device)
+                gen.manual_seed(int(seed) + bi)
             # Score the ENSEMBLE MEAN, not a single draw. This was
             # ensemble=1, which quietly penalised the model for being
             # generative: RMSE is minimised by the conditional MEAN, and a
@@ -639,7 +833,7 @@ def sampled_skill(model, loader, device, steps=16, members=4, max_batches=4):
             # scored with one member anyway.
             ens = ml_diffusion.sample_residual(
                 model, inputs, out_channels=targets.shape[1],
-                steps=steps, ensemble=members
+                steps=steps, ensemble=members, generator=gen
             )
             drawn = ens.mean(dim=0)
             spread_sum += float((ens.std(dim=0, unbiased=(members > 1)) * masks).sum())
@@ -695,6 +889,19 @@ def sampled_skill(model, loader, device, steps=16, members=4, max_batches=4):
             se_model += float((((drawn - targets) ** 2) * masks).sum())
             se_zero += float(((targets ** 2) * masks).sum())
             n_px += float(masks.sum())
+            try:
+                _rr = rr.to(device).unsqueeze(1)                  # (B, 1, H, W)
+                _em = ((drawn - targets) ** 2) * masks
+                _ez = (targets ** 2) * masks
+                for b, (lo_, hi_) in enumerate(RADIUS_BINS):
+                    sel = ((_rr >= lo_) & (_rr < hi_)).float()
+                    for tag, sl in (("all", slice(None)), ("h37", slice(1, 2))):
+                        acc = rb[(tag, b)]
+                        acc[0] += float((_em[:, sl] * sel).sum())
+                        acc[1] += float((_ez[:, sl] * sel).sum())
+                        acc[2] += float((masks[:, sl] * sel).sum())
+            except Exception:
+                pass    # diagnostic only
     if n_px == 0:
         return None
     rmse_model = (se_model / n_px) ** 0.5 * TB_STD
@@ -719,7 +926,12 @@ def sampled_skill(model, loader, device, steps=16, members=4, max_batches=4):
             "overconfidence": (rmse_model / spread_k) if spread_k > 0 else float("nan"),
             # The floor an infinite ensemble would reach -- how much of
             # the residual is bias that no amount of sampling removes.
-            "skill_ceiling": 1.0 - (bias_k / rmse_zero) if rmse_zero > 0 else 0.0}
+            "skill_ceiling": 1.0 - (bias_k / rmse_zero) if rmse_zero > 0 else 0.0,
+            "skill_by_radius": {
+                tag: [(RADIUS_BINS[b], (1.0 - (rb[(tag, b)][0] / rb[(tag, b)][1]) ** 0.5)
+                       if rb[(tag, b)][1] > 0 else None, int(rb[(tag, b)][2]))
+                      for b in range(len(RADIUS_BINS))]
+                for tag in ("all", "h37")}}
 
 
 def training_scalar_stats(file_paths: list) -> dict:
@@ -808,6 +1020,41 @@ def train(
         print("Backbone physics vintage: "
               + ", ".join(f"{k} ({len(v)})" for k, v in sorted(physics_groups.items())))
 
+    # Which extra IR bands are REAL in this data (0.159). Until 0.159 none
+    # were ever fetched, so every NPZ carried neutral planes there, and a
+    # model trained on them has learned those channels are flat. The
+    # fraction is saved in the checkpoint; inference feeds real bands only
+    # to a checkpoint that was trained on them.
+    extra_ir_real_fraction = extra_ir_coverage(train_files)
+    if extra_ir_real_fraction:
+        print("Extra IR bands with real data: " + ", ".join(
+            f"{b}: {f:.0%}" for b, f in sorted(extra_ir_real_fraction.items())))
+        mixed = [b for b, f in extra_ir_real_fraction.items() if 0.0 < f < 0.9]
+        if mixed:
+            print(f"WARNING: bands {mixed} are real in only SOME examples -- the model "
+                  f"sees the same channel as real data in some and a flat plane in "
+                  f"others. Run backfill_npz.py --extra-ir on the older NPZs first.")
+
+    # Land-mask provenance (0.166). Mixed backends = mixed coastlines under
+    # one physics ID; pre-0.166 files record none.
+    _bk = {}
+    for _f in train_files:
+        try:
+            with np.load(_f) as _z:
+                _k = str(_z["land_mask_backend"]) if "land_mask_backend" in _z.files else "unrecorded"
+        except Exception:
+            _k = "unreadable"
+        _bk[_k] = _bk.get(_k, 0) + 1
+    print("Land mask used to build the examples: " + ", ".join(f"{k} {v}" for k, v in sorted(_bk.items())))
+    if len([k for k in _bk if k not in ("unrecorded", "unreadable")]) > 1:
+        print("WARNING: examples built with DIFFERENT land masks -- coastlines differ between them.")
+
+    env_frac = env_coverage(train_files)
+    print(f"ERA5 environment present in {env_frac:.0%} of training examples"
+          + ("" if env_frac >= 0.9 else
+             " -- run backfill_npz.py first; without it the environment "
+             "channels only ever say 'absent'"))
+
     train_scalar_stats = training_scalar_stats(train_files)
     if train_scalar_stats:
         print(f"Training distribution: vmax {train_scalar_stats['vmax_mean']:.0f}"
@@ -826,9 +1073,23 @@ def train(
     if num_workers > 0:
         loader_kw["persistent_workers"] = True
         loader_kw["prefetch_factor"] = 4
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
-                              drop_last=True, **loader_kw)
+    _weights, _regime_note = regime_weights(train_files)
+    print(_regime_note)
+    if _weights is not None:
+        from torch.utils.data import WeightedRandomSampler
+        # Same epoch length as a shuffle; rare regimes drawn more often.
+        _sampler = WeightedRandomSampler(_weights, num_samples=len(train_ds), replacement=True)
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=_sampler,
+                                  drop_last=True, **loader_kw)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                                  drop_last=True, **loader_kw)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kw)
+    eval_files = stratified_eval_subset(val_files, EVAL_SUBSET_SIZE)
+    eval_loader = DataLoader(MWCorrectionDataset(eval_files, patch_size=patch_size, augment=False),
+                             batch_size=batch_size, shuffle=False, **loader_kw)
+    print(f"Per-epoch skill: {len(eval_files)} fixed validation examples, intensity-stratified, "
+          f"seeded draws ({EVAL_MEMBERS} members); full set ({len(val_files)}) scored at the end")
 
     # Architecture switch (ml_constants.CORRECTION_ARCH). Both are trained
     # by the same loop; only the model and the loss differ.
@@ -906,11 +1167,19 @@ def train(
     os.makedirs(checkpoint_dir, exist_ok=True)
     best_val_loss = float("inf")
 
+    _base = getattr(model, "_orig_mod", model)          # through torch.compile
+    ema_model = copy.deepcopy(_base).eval() if USE_EMA else None
+    if ema_model is not None:
+        for _p in ema_model.parameters():
+            _p.requires_grad_(False)
+    ema_step = 0
+    best_loss_only = float("inf")
+    best_epochs = {"skill": None, "loss": None}
     for epoch in range(epochs):
         model.train()
         train_loss_sum, train_batches = 0.0, 0
         epoch_supervised_px = 0.0
-        for inputs, targets, masks, _vmax in train_loader:
+        for inputs, targets, masks, _vmax, _rr in train_loader:
             inputs, targets, masks = inputs.to(device), targets.to(device), masks.to(device)
             epoch_supervised_px += masked_pixel_count(masks)
             optimizer.zero_grad()
@@ -928,23 +1197,32 @@ def train(
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
+            if ema_model is not None:
+                ema_step += 1
+                _d = min(EMA_DECAY, (1.0 + ema_step) / (10.0 + ema_step))   # warm-up
+                with torch.no_grad():
+                    for _e, _q in zip(ema_model.parameters(), _base.parameters()):
+                        _e.mul_(_d).add_(_q.detach(), alpha=1.0 - _d)
+                    for _eb, _b in zip(ema_model.buffers(), _base.buffers()):
+                        _eb.copy_(_b)
             train_loss_sum += loss.item()
             train_batches += 1
 
         model.eval()
+        evm = ema_model if ema_model is not None else model   # what is scored and saved
         val_loss_sum, val_batches = 0.0, 0
         val_l1_sum, val_pct_sum = 0.0, 0.0
         band_sums, band_counts = {}, {}
         with torch.no_grad():
-            for inputs, targets, masks, vmax_b in val_loader:
+            for inputs, targets, masks, vmax_b, _rr in val_loader:
                 inputs, targets, masks = inputs.to(device), targets.to(device), masks.to(device)
                 with torch.amp.autocast("cuda", enabled=(device == "cuda")):
                     if CORRECTION_ARCH == "diffusion":
-                        loss = ml_diffusion.flow_matching_loss(model, targets, inputs, masks)
+                        loss = ml_diffusion.flow_matching_loss(evm, targets, inputs, masks)
                         l1 = pct = loss
                         pred = None
                     else:
-                        pred = model(inputs)
+                        pred = evm(inputs)
                         loss, l1, pct = combined_loss(pred, targets, masks)
                 val_loss_sum += loss.item()
                 val_l1_sum += l1.item()
@@ -958,7 +1236,7 @@ def train(
                     sl = slice(i, i + 1)
                     if CORRECTION_ARCH == "diffusion":
                         s_loss = ml_diffusion.flow_matching_loss(
-                            model, targets[sl], inputs[sl], masks[sl])
+                            evm, targets[sl], inputs[sl], masks[sl])
                     else:
                         s_loss, _, _ = combined_loss(pred[sl], targets[sl], masks[sl])
                     key = band_label(float(vmax_b[i]))
@@ -993,7 +1271,7 @@ def train(
         # number costs the whole run.
         sk = None
         if CORRECTION_ARCH == "diffusion":
-            sk = sampled_skill(model, val_loader, device)
+            sk = sampled_skill(evm, eval_loader, device, members=EVAL_MEMBERS, seed=EVAL_SEED)
             if sk:
                 verdict = ("beats doing nothing" if sk["skill"] > 0.02
                            else "NO BETTER than leaving the backbone alone"
@@ -1004,16 +1282,32 @@ def train(
                       f"ensemble spread {sk['mean_spread_k']:.2f}K")
                 _off = sk.get("skill_offset_only")
                 if _off is not None and sk.get("skill") is not None:
-                    _share = _off / sk["skill"] if sk["skill"] > 0 else float("nan")
-                    print(f"      of that skill, {_share*100:.0f}% is reachable with a "
-                          f"FLAT offset alone (skill {_off:+.3f}) -- the rest is "
-                          f"structure the constants cannot supply")
+                    # A share only means something when the model has
+                    # positive skill to share out. At epoch 1 of the
+                    # post-fix run it was -0.069 while a flat offset alone
+                    # reached +0.135, and the division printed "nan%" --
+                    # hiding the one fact worth reporting: a constant
+                    # shift would have beaten the model outright.
+                    if sk["skill"] > 0:
+                        print(f"      of that skill, {_off / sk['skill'] * 100:.0f}% is "
+                              f"reachable with a FLAT offset alone (skill {_off:+.3f}) "
+                              f"-- the rest is structure the constants cannot supply")
+                    else:
+                        print(f"      a FLAT offset alone would reach skill {_off:+.3f}, "
+                              f"beating the model's {sk['skill']:+.3f} -- no structure "
+                              f"learned yet")
                 if np.isfinite(sk.get("crps_k", float("nan"))):
                     # CRPS is a PROPER scoring rule: it rewards sharpness
                     # only when justified, so unlike the skill number it
                     # can see the ensemble's 1.95x overconfidence.
                     print(f"      CRPS {sk['crps_k']:.2f}K "
                           f"(proper score; penalises over- and under-spread)")
+                _sbr = sk.get("skill_by_radius") or {}
+                for _tag in ("all", "h37"):
+                    _cells = [f"{lo_:g}-{hi_:g}: {v:+.3f}" if v is not None else f"{lo_:g}-{hi_:g}: ---"
+                              for (lo_, hi_), v, n in _sbr.get(_tag, [])]
+                    if _cells:
+                        print(f"      skill by r/RMW ({_tag}): " + "  ".join(_cells).replace("-inf", "+"))
                 print(f"      bias {sk['bias_k']:.2f}K + spread {sk['sigma_k']:.2f}K "
                       f"-> ceiling at infinite members skill {sk['skill_ceiling']:+.3f}; "
                       f"overconfidence {sk['overconfidence']:.2f}x")
@@ -1050,55 +1344,79 @@ def train(
         if val_batches:
             scheduler.step(val_loss)
 
+        _ck = {
+            "model_state_dict": evm.state_dict(),
+            "ema": ema_model is not None,
+            "epoch": epoch,
+            "val_loss": val_loss,
+            "val_l1": val_l1,
+            "val_pct": val_pct,
+            # Per-band validation loss at the moment this checkpoint
+            # was selected. Recorded so a checkpoint can be judged on
+            # whether it is uniformly decent or merely good on the
+            # intensity band that happened to dominate the val set --
+            # a single scalar val_loss cannot distinguish those, and
+            # the difference is the whole reason this stratification
+            # exists.
+            "val_by_band": {k: band_sums[k] / band_counts[k] for k in band_sums},
+            "val_band_counts": dict(band_counts),
+            "pct_loss_weight": PCT_LOSS_WEIGHT,
+            "mirror_augmentation": ALLOW_MIRROR_AUGMENTATION,
+            # Backbone physics this model's residuals are measured
+            # against. ml_inference refuses to trust a checkpoint
+            # whose value differs from the live backbone.
+            "vh_physics_id": _vh_physics_id(),
+            "in_channels": MODEL_IN_CHANNELS,
+            "extra_ir_real_fraction": extra_ir_real_fraction,
+            "env_channels": list(ENV_CHANNELS),
+            "env_dropout_p": ENV_DROPOUT_P,
+            "env_coverage": env_frac,
+            "regime_weighting": {"on": _weights is not None, "ri_past24_kt": RI_PAST24_KT,
+                                 "ri_weight": RI_WEIGHT, "high_shear_ms": HIGH_SHEAR_MS,
+                                 "high_shear_weight": HIGH_SHEAR_WEIGHT,
+                                 "cap": REGIME_WEIGHT_CAP},
+            "arch": CORRECTION_ARCH,
+            "patch_sample_stride": PATCH_SAMPLE_STRIDE,
+            # Consumed by ml_inference's novelty taper.
+            "train_scalar_stats": train_scalar_stats,
+            # MEASURED, so inference stops relying on a constant that
+            # was right for one run. Overconfidence climbed 1.43x ->
+            # 3.85x across a single training run as the ensemble
+            # collapsed, so no single hardcoded figure can be correct
+            # for both ends of it.
+            "ensemble_overconfidence": (
+                float(sk["mean_spread_k"] and
+                      (sk["rmse_model_k"] / sk["mean_spread_k"]))
+                if sk and sk.get("mean_spread_k") else None),
+            "scalar_dropout_p": SCALAR_DROPOUT_P,
+            # The width actually BUILT (0.160). This saved the
+            # function argument, the U-Net default 32, while the
+            # diffusion model was built at DIFFUSION_BASE_CHANNELS (48),
+            # so inference rebuilt every diffusion checkpoint too
+            # narrow and silently ran without it.
+            "base_channels": (DIFFUSION_BASE_CHANNELS if CORRECTION_ARCH == "diffusion"
+                              else base_channels),
+            "tb_mean": TB_MEAN,
+            "tb_std": TB_STD,
+            "saved_at": datetime.now().isoformat(),
+        }
+        if val_batches and val_loss < best_loss_only:
+            # The lowest-validation-loss model, kept alongside: the end-of-run
+            # full-set check decides between the two (0.169).
+            best_loss_only = val_loss
+            best_epochs["loss"] = epoch
+            torch.save(_ck, os.path.join(checkpoint_dir, "mw_correction_best_loss.pt"))
         if val_batches and selection_metric < best_val_loss:
             best_val_loss = selection_metric
             epochs_since_improvement = 0
+            best_epochs["skill"] = epoch
             ckpt_path = os.path.join(checkpoint_dir, "mw_correction_best.pt")
-            torch.save({
-                "model_state_dict": model.state_dict(),
-                "epoch": epoch,
-                "val_loss": val_loss,
-                "val_l1": val_l1,
-                "val_pct": val_pct,
-                # Per-band validation loss at the moment this checkpoint
-                # was selected. Recorded so a checkpoint can be judged on
-                # whether it is uniformly decent or merely good on the
-                # intensity band that happened to dominate the val set --
-                # a single scalar val_loss cannot distinguish those, and
-                # the difference is the whole reason this stratification
-                # exists.
-                "val_by_band": {k: band_sums[k] / band_counts[k] for k in band_sums},
-                "val_band_counts": dict(band_counts),
-                "pct_loss_weight": PCT_LOSS_WEIGHT,
-                "mirror_augmentation": ALLOW_MIRROR_AUGMENTATION,
-                # Backbone physics this model's residuals are measured
-                # against. ml_inference refuses to trust a checkpoint
-                # whose value differs from the live backbone.
-                "vh_physics_id": _vh_physics_id(),
-                "in_channels": MODEL_IN_CHANNELS,
-                "arch": CORRECTION_ARCH,
-                "patch_sample_stride": PATCH_SAMPLE_STRIDE,
-                # Consumed by ml_inference's novelty taper.
-                "train_scalar_stats": train_scalar_stats,
-                # MEASURED, so inference stops relying on a constant that
-                # was right for one run. Overconfidence climbed 1.43x ->
-                # 3.85x across a single training run as the ensemble
-                # collapsed, so no single hardcoded figure can be correct
-                # for both ends of it.
-                "ensemble_overconfidence": (
-                    float(sk["mean_spread_k"] and
-                          (sk["rmse_model_k"] / sk["mean_spread_k"]))
-                    if sk and sk.get("mean_spread_k") else None),
-                "scalar_dropout_p": SCALAR_DROPOUT_P,
-                "base_channels": base_channels,
-                "tb_mean": TB_MEAN,
-                "tb_std": TB_STD,
-                "saved_at": datetime.now().isoformat(),
-            }, ckpt_path)
+            torch.save(_ck, ckpt_path)
             print(f"  saved new best checkpoint: {ckpt_path} (val_loss={val_loss:.4f}{" skill=%+.3f" % sk["skill"] if sk else ""})")
         elif val_batches:
             epochs_since_improvement += 1
-            if early_stop_patience and epochs_since_improvement >= early_stop_patience:
+            if (early_stop_patience and epochs_since_improvement >= early_stop_patience
+                    and epoch + 1 >= MIN_EPOCHS_BEFORE_STOP):
                 print(f"\nNo validation improvement for {early_stop_patience} epochs "
                       f"(best {best_val_loss:.4f}"
                       + (" = -skill" if CORRECTION_ARCH == "diffusion" else "")
@@ -1106,6 +1424,8 @@ def train(
                       "checkpoint is already the best one seen.")
                 break
 
+    if CORRECTION_ARCH == "diffusion":
+        final_selection(_base, val_loader, device, checkpoint_dir, best_epochs)
     print("Training complete.")
 
 

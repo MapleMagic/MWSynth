@@ -44,14 +44,31 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 
 import ml_data_mining
-import ml_train
 import training_data_export as tde
+# ml_train is imported inside run_training() (0.161). It imports torch, and
+# on Windows every mining PROCESS re-imports this script at startup, so a
+# top-level import loaded torch into each of them for nothing.
 
 # --- mining knobs -----------------------------------------------------
 MAX_PER_STORM = None
-MAX_WORKERS = 10          # concurrent GOES downloads; raise on a fast line
+MAX_WORKERS = 10          # concurrent overpasses (capped to fit memory at start)
+# Separate worker PROCESSES (0.161) rather than threads. Threads shared one
+# GIL and h5py's global lock: a real threaded run timed every phase ~8x
+# slower than alone, generate included, i.e. no parallelism at all.
+# --threads switches back, e.g. if processes misbehave on some machine.
+USE_PROCESSES = True
+# Skip overpasses already done under the current physics (0.162): the
+# ledger, source_overpass tags, and older NPZs matched by storm/sensor/time.
+# --fresh redoes everything.
+RESUME = True
+# Where steps 1-3 read and write training examples (0.166). None = the
+# default ~/.synthetic_mw_tc/training_data. A separate folder keeps a test
+# mine -- e.g. an overnight timing run -- from mixing with, or resuming
+# over, an existing dataset.
+DATA_DIR = None
 
 # Link speeds the estimate reports, in Mbps. Override with --mbps to see
 # the figure for your actual connection rather than these defaults.
@@ -63,6 +80,12 @@ LINK_MBPS = (50, 200)
 # does not make the estimate promise a runtime the CPU cannot deliver.
 # Correct it once a real season has been timed.
 SECONDS_PER_EXAMPLE_CPU = 4.0
+
+# Measured per saved example, 0.157 live run (19 x 2024 AL, all bytes
+# accounted): GOES is every sector and listing after the full-disk chunk
+# prefetch; GLM is ~30 whole 20 s granules for a +/-5 min window.
+GOES_MB_PER_EXAMPLE = 3.6
+GLM_MB_PER_EXAMPLE = 11.3
 
 # Basins with no GOES coverage at all. Skipped before any best-track
 # lookup so they cost nothing. Set to () to attempt them anyway once
@@ -90,13 +113,13 @@ COMPILE_MODEL = False
 # combination is amplified up to 3.36x at 37 GHz -- so a model selected
 # on L1 alone is selected on a quantity only loosely related to what the
 # output looks like. Set to 0 to reproduce the pre-0.88 objective.
-PCT_LOSS_WEIGHT = ml_train.PCT_LOSS_WEIGHT
+PCT_LOSS_WEIGHT = None      # None = ml_train's own default
 
 # Probability of blanking the vmax/RMW conditioning layers per sample.
 # Counteracts the model leaning on those constant layers instead of the
 # imagery -- the suspected cause of a real failure where a 50 kt storm
 # with a genuine core had that core suppressed. Set to 0 to disable.
-SCALAR_DROPOUT_P = ml_train.SCALAR_DROPOUT_P
+SCALAR_DROPOUT_P = None     # None = ml_train's own default
 
 
 # --- Mining source ---------------------------------------------------
@@ -139,7 +162,12 @@ AGENCY_BASINS = {
 GOES_COVERED_BASINS = ("AL", "EP", "CP")
 
 
-def estimate_mining() -> None:
+def _fmt_hours(h: float) -> str:
+    """'~0.0 h' says nothing about a short run; minutes below an hour."""
+    return f"{h * 60:.0f} min" if h < 1 else f"{h:.1f} h"
+
+
+def estimate_mining(max_per_storm=None) -> None:
     """Pre-flight: count what a streaming run would process, before it
     starts. Listing S3 is cheap (no file bodies), so this costs seconds
     and answers 'how long is this going to take' with a number rather
@@ -148,29 +176,37 @@ def estimate_mining() -> None:
 
     total_files = 0
     total_bytes = 0
+    capped_files = 0
     storms = 0
     per_instrument: dict = {}
     other: dict = {}
-    for season in SEASONS:
-        for storm in tp.list_available_storms(season_start=season, season_end=season,
-                                              basins=BASINS or None):
-            if storm["basin"] in EXCLUDE_BASINS:
+    # Every storm directory listed ONCE, in parallel (0.162) -- it was one
+    # at a time, ~0.17 s each, ~51 s for 301 storms. Mining later in the
+    # same run reads tcprimed_ingest's listing cache instead of re-listing.
+    _storms = [st for season in SEASONS
+               for st in tp.list_available_storms(season_start=season, season_end=season,
+                                                  basins=BASINS or None)
+               if st["basin"] not in EXCLUDE_BASINS]
+    for storm, _files in zip(_storms, tp.list_overpass_files_many(_storms)):
+        storms += 1
+        storm_files = 0
+        for f in _files:
+            # Filter to the instruments this project can actually
+            # read. Without this the count includes the whole GPM
+            # constellation and over-reports several times over.
+            inst = f.get("instrument")
+            if inst not in tp.SUPPORTED_INSTRUMENTS:
+                other[inst] = other.get(inst, 0) + 1
                 continue
-            storms += 1
-            for f in tp.list_storm_overpass_files(
-                basin=storm["basin"], storm_num=storm["storm_num"],
-                season=storm["season"],
-            ):
-                # Filter to the instruments this project can actually
-                # read. Without this the count includes the whole GPM
-                # constellation and over-reports several times over.
-                inst = f.get("instrument")
-                if inst not in tp.SUPPORTED_INSTRUMENTS:
-                    other[inst] = other.get(inst, 0) + 1
-                    continue
-                per_instrument[inst] = per_instrument.get(inst, 0) + 1
-                total_files += 1
-                total_bytes += f.get("size_bytes", 0)
+            per_instrument[inst] = per_instrument.get(inst, 0) + 1
+            total_files += 1
+            total_bytes += f.get("size_bytes", 0)
+            storm_files += 1
+        # --max-per-storm bounds what is actually READ. 0.156 ran the
+        # estimate before that flag was parsed, so a capped run was
+        # sized as if every overpass would be fetched.
+        capped_files += (min(storm_files, max_per_storm) if max_per_storm
+                         else storm_files)
 
     print(f"Seasons {list(SEASONS)}, basins {list(BASINS)}")
     print(f"  storms: {storms}")
@@ -188,42 +224,42 @@ def estimate_mining() -> None:
     # project reads span most of a 13-20 MB object, so partial reads save
     # very little. Files under 64 MB are now fetched whole in one request
     # (see s3_range_reader.WHOLE_OBJECT_MAX_BYTES).
-    print(f"  expected transfer: ~{tp.format_bytes(int(total_bytes * 0.95))} "
-          f"(measured ~93-100% of each file is read)")
+    # Whole files are downloaded. The reader itself needs only ~4-11% of
+    # each (measured in 0.162: 0.7-1.6 MB of 15-18 MB); the old "93-100%
+    # is read" note described the download, not the need. See CHANGELOG.
+    print(f"  TC PRIMED if EVERY overpass were read: "
+          f"~{tp.format_bytes(int(total_bytes))} (whole files are downloaded)")
     print(f"  written to local disk: 0 bytes of source data")
-    # --- The GOES side, quantified -----------------------------------
-    # Saying "the GOES fetch dominates" without a number is not useful
-    # when that is the thing deciding the runtime. These are ASSUMPTIONS,
-    # labelled as such: the survival rate especially varies with basin
-    # and season (a storm outside GOES view contributes nothing), and the
-    # only way to pin it down is to run one season and look at the skip
-    # reasons.
-    from ml_constants import EXTRA_IR_FETCH_LIMIT
-    bands = 4 + min(EXTRA_IR_FETCH_LIMIT, 3)      # 13/9/7/2 plus extras
-    goes_mb_per_band = 12                          # typical ABI mesoscale sector
-    for survival, label in ((0.4, "pessimistic"), (0.7, "optimistic")):
-        examples = int(total_files * survival)
-        goes_gb = examples * bands * goes_mb_per_band / 1000
-        print(f"  if {int(survival*100)}% of overpasses yield an example ({label}):")
-        print(f"      ~{examples} training examples, ~{goes_gb:.1f} GB of GOES traffic "
-              f"({bands} bands each)")
-        # Wall-clock, with the assumption stated. Transfer-bound is the
-        # right model here: the parametric algorithm is fast next to
-        # moving tens of GB, and mining runs several workers in parallel.
-        total_gb = goes_gb + total_bytes * 0.3 / 1e9
+    # --- Per-example transfer, MEASURED --------------------------------
+    # 0.157 mined 19 overpasses (one per 2024 Atlantic storm) against live
+    # S3 with every byte accounted for, and the old model was wrong three
+    # ways: it charged 12 MB x 7 bands = 84 MB of GOES per example (real:
+    # ~3.6 MB after the full-disk chunk prefetch), it left GLM out entirely
+    # (real: 11.3 MB, the second-largest stream), and its time line read
+    # TC PRIMED at 30% while the line above it correctly said ~95-100%.
+    # Survival was 40-70%; measured runs since the full-disk fallback have
+    # yielded 96% and 100%.
+    mean_file = total_bytes / max(total_files, 1)
+    if max_per_storm:
+        print(f"  --max-per-storm {max_per_storm}: {capped_files} of "
+              f"{total_files} overpasses will be read")
+    for survival, label in ((0.80, "cautious"), (0.96, "as measured")):
+        examples = int(capped_files * survival)
+        tcp_gb = capped_files * mean_file / 1e9          # read whole, every attempt
+        goes_gb = examples * GOES_MB_PER_EXAMPLE / 1000
+        glm_gb = examples * GLM_MB_PER_EXAMPLE / 1000
+        total_gb = tcp_gb + goes_gb + glm_gb
+        print(f"  if {int(survival*100)}% of attempts yield an example ({label}):")
+        print(f"      ~{examples} training examples, ~{total_gb:.1f} GB total "
+              f"(TC PRIMED {tcp_gb:.1f}, GLM {glm_gb:.1f}, GOES {goes_gb:.1f})")
         for mbps in LINK_MBPS:
             hours = total_gb * 8 * 1000 / mbps / 3600
-            print(f"      at {mbps} Mbps sustained: ~{hours:.1f} h of transfer")
-        # A transfer-bound estimate stops being the right model on a fast
-        # link. Each example also costs CPU -- scattered-point regridding
-        # of the MW swath, several gaussian filters, the composites, the
-        # structure metrics and the centre check -- which no amount of
-        # bandwidth removes. SECONDS_PER_EXAMPLE_CPU is a rough per-core
-        # figure; with max_workers in flight the wall clock is that
-        # divided by however many cores actually keep up.
+            print(f"      at {mbps} Mbps sustained: ~{_fmt_hours(hours)} of transfer")
+        # Transfer is not the whole cost: generation is CPU no bandwidth
+        # removes, and at these byte counts it is often the larger term.
         cpu_hours = examples * SECONDS_PER_EXAMPLE_CPU / 3600
         print(f"      CPU floor (~{SECONDS_PER_EXAMPLE_CPU}s/example, serial): "
-              f"~{cpu_hours:.1f} h; less with workers, but it does not scale "
+              f"~{_fmt_hours(cpu_hours)}; less with workers, but it does not scale "
               f"with bandwidth")
     print()
     if max(LINK_MBPS) >= 500:
@@ -231,12 +267,12 @@ def estimate_mining() -> None:
         print(f"  CPU is. Raising MAX_WORKERS (currently {MAX_WORKERS}) helps only until")
         print("  the cores saturate, so expect the CPU floor above, not the transfer line.")
     else:
-        print("  So the GOES fetch is likely both the slower AND the larger half.")
+        print("  TC PRIMED and GLM are now the larger transfers; GOES crops are small.")
     print("  TC-PRIMED streaming removed a STORAGE ceiling, not a time one.")
     print()
-    print("  Survival rate is the big unknown -- run one season first and read")
-    print("  the skip reasons, then extrapolate. Storms outside GOES view, or")
-    print("  before GOES-16/17/18 existed, contribute nothing.")
+    print("  Survival was 96% and 100% on the two runs measured since the full-disk")
+    print("  fallback. Storms outside GOES view (most of WP/IO/SH), or before")
+    print("  GOES-16 existed, still contribute nothing.")
 
 
 def preflight() -> bool:
@@ -269,8 +305,11 @@ def preflight() -> bool:
                                     mesoscale_sector="M1")
         fix = StormFix(storm_id="XX012022", valid_time=t, lat=15.0, lon=-153.0,
                        vmax_kt=95.0, mslp_mb=960.0, rmw_nm=20.0, roci_nm=200.0)
+        # ml_strength=0.0, exactly as mining calls it (0.162). Once 0.160
+        # made checkpoints load, this synthetic check ran the full diffusion
+        # ensemble on the CPU: ~42 s of a 44 s do-nothing resume.
         r = generate_synthetic_mw(mk(ir, 13), mk(ir + 3, 9), mk(ir + 6, 7), fix,
-                                  real_swath=None)
+                                  real_swath=None, ml_strength=0.0)
         for name in ("v37", "h37", "v89", "h89"):
             arr = getattr(r, name)
             if not np.all(np.isfinite(arr)):
@@ -325,15 +364,35 @@ def preflight() -> bool:
 
     print("Preflight OK: generation path intact and time conventions agree "
           "(synthetic, no network).")
+    # Which land mask the backbone will use (0.165). The land fraction
+    # feeds the background along every coast, and only the packed
+    # global_land_mask copy is pinned: cartopy's Natural Earth data can
+    # change between runs -- one real example differed at 21 coastal
+    # pixels between mining and a later replay on the same machine.
+    try:
+        import surface_type
+        _bk = surface_type.backend_name()
+        if _bk in ("packed", "global_land_mask"):
+            print(f"Land mask: {_bk} (1 km, pinned)")
+        else:
+            print(f"Land mask: {_bk} -- NOT pinned; coastlines may differ from other runs. "
+                  f"`pip install global-land-mask` before a full mine.")
+    except Exception:
+        pass
     return True
 
 
+_mine_t0 = 0.0
+
+
 def run_mining() -> int:
+    global _mine_t0
+    _mine_t0 = time.time()
     print("=" * 70)
     if STREAM_FROM_S3:
         print("Step 1: streaming TC-PRIMED from S3 into training examples")
         print("=" * 70)
-        estimate_mining()
+        estimate_mining(max_per_storm=MAX_PER_STORM)
     else:
         print("Step 1: processing LOCAL TC-PRIMED cache into training examples")
         print("       (STREAM_FROM_S3 is False -- this only sees files already")
@@ -342,13 +401,18 @@ def run_mining() -> int:
     if not preflight():
         return 0
 
+    if DATA_DIR:
+        print(f"Data folder: {DATA_DIR}")
     result = ml_data_mining.mine_local_tcprimed_cache(
+        output_dir=DATA_DIR,
         progress_callback=print, max_workers=MAX_WORKERS,
         max_per_storm=MAX_PER_STORM,
         exclude_basins=EXCLUDE_BASINS,
         stream=STREAM_FROM_S3,
         seasons=SEASONS if STREAM_FROM_S3 else (),
         basins=BASINS if STREAM_FROM_S3 else (),
+        use_processes=USE_PROCESSES,
+        resume=RESUME,
     )
     print()
     if result.get("aborted"):
@@ -368,7 +432,25 @@ def run_mining() -> int:
             if _k in _pt:
                 print(f"  {_k:<10} {_pt[_k]/_n:6.2f} s")
         print(f"  {'total':<10} {sum(v for k, v in _pt.items() if k != '_n')/_n:6.2f} s"
-              f"   (wall clock is this divided by workers)")
+              f"   (per example, summed over phases; runs overlap across workers)")
+    _wall = time.time() - _mine_t0
+    if result.get("saved"):
+        print(f"Wall clock: {_wall/60:.1f} min for {result['saved']:,} saved "
+              f"= {_wall/result['saved']:.1f} s per saved example")
+    # Extra IR outcome. Until 0.159 every one of these bands failed with a
+    # swallowed ValueError and nothing anywhere said so.
+    try:
+        import goes_fetch as _gf
+        _eb = _gf.EXTRA_BAND_STATS
+        if _eb["requested"]:
+            _miss = sum(_eb["missing"].values())
+            print(f"Extra IR bands: {_eb['requested'] - _miss:,} of {_eb['requested']:,} "
+                  f"fetched ({1 - _miss / _eb['requested']:.0%})"
+                  + (f"; missing by band {dict(sorted(_eb['missing'].items()))}" if _miss else ""))
+            for _b, _e in sorted(_eb["last_error"].items()):
+                print(f"  band {_b} last error: {_e}")
+    except Exception:
+        pass
     print()
     print(f"Attempted: {result['attempted']}, saved: {result['saved']}")
     print(f"Storms processed: {result['storms_processed']}")
@@ -398,7 +480,8 @@ def run_calibration(apply_fit: bool = False) -> bool:
     print("=" * 70)
     print("Step 3: fitting calibration constants against the mined data")
     print("=" * 70)
-    result = cc.fit_from_dataset(progress_callback=print)
+    result = cc.fit_from_dataset(progress_callback=print,
+                                 **({"data_dir": DATA_DIR} if DATA_DIR else {}))
     if not result.get("fitted"):
         print(result.get("note", "no fit produced"))
         return False
@@ -442,11 +525,16 @@ def run_training() -> None:
     print("=" * 70)
     # Push the module-level knobs through so editing them here actually
     # takes effect (train() reads them from ml_train's namespace).
-    ml_train.PCT_LOSS_WEIGHT = PCT_LOSS_WEIGHT
-    ml_train.SCALAR_DROPOUT_P = SCALAR_DROPOUT_P
-    print(f"PCT loss weight: {PCT_LOSS_WEIGHT}, scalar dropout: {SCALAR_DROPOUT_P}")
+    import ml_train
+    if PCT_LOSS_WEIGHT is not None:
+        ml_train.PCT_LOSS_WEIGHT = PCT_LOSS_WEIGHT
+    if SCALAR_DROPOUT_P is not None:
+        ml_train.SCALAR_DROPOUT_P = SCALAR_DROPOUT_P
+    print(f"PCT loss weight: {ml_train.PCT_LOSS_WEIGHT}, "
+          f"scalar dropout: {ml_train.SCALAR_DROPOUT_P}")
+    _kw = {"data_dir": DATA_DIR} if DATA_DIR else {}
     ml_train.train(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,
-                   epochs=EPOCHS, compile_model=COMPILE_MODEL)
+                   epochs=EPOCHS, compile_model=COMPILE_MODEL, **_kw)
 
 
 def prompt_for_step() -> str:
@@ -476,9 +564,17 @@ def main():
                          "(mine -> fit -> re-mine -> train), all=1+2. "
                          "Omit to be prompted.")
     ap.add_argument("--workers", type=int, default=None,
-                    help="concurrent overpasses (default 10). This work is "
-                         "round-trip bound, so more helps until S3 throttling "
-                         "or local CPU takes over.")
+                    help="concurrent overpasses (default 10; capped at start to "
+                         "fit available memory, and the log says so).")
+    ap.add_argument("--data-dir", metavar="PATH", default=None,
+                    help="folder for training examples (default ~/.synthetic_mw_tc/"
+                         "training_data); a separate folder keeps a test mine apart")
+    ap.add_argument("--fresh", action="store_true",
+                    help="redo every overpass instead of resuming (a physics "
+                         "change always redoes affected ones anyway)")
+    ap.add_argument("--threads", action="store_true",
+                    help="mine with threads in one process instead of separate "
+                         "worker processes (the pre-0.161 behaviour)")
     ap.add_argument("--max-per-storm", type=int, default=None,
                     help="cap examples per storm, spread across its lifetime. "
                          "Overpasses of one storm are highly correlated, so "
@@ -537,12 +633,21 @@ def main():
         if not STREAM_FROM_S3:
             print("--estimate only applies to streaming mode (--stream true).")
             return
-        estimate_mining()
+        estimate_mining(max_per_storm=args.max_per_storm)
         return
 
-    global MAX_WORKERS, MAX_PER_STORM
+    global MAX_WORKERS, MAX_PER_STORM, USE_PROCESSES, RESUME, DATA_DIR
     if args.workers:
         MAX_WORKERS = args.workers
+    if getattr(args, "threads", False):
+        USE_PROCESSES = False
+    if getattr(args, "fresh", False):
+        RESUME = False
+    if getattr(args, "data_dir", None):
+        import os as _os
+        DATA_DIR = _os.path.abspath(_os.path.expanduser(args.data_dir))
+        _os.makedirs(DATA_DIR, exist_ok=True)
+        tde.DEFAULT_EXPORT_DIR = DATA_DIR      # everything resolving the default follows
     if args.max_per_storm:
         MAX_PER_STORM = args.max_per_storm
         print(f"Capping at {MAX_PER_STORM} example(s) per storm, spread across "

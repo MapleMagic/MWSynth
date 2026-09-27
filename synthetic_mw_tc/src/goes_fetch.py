@@ -156,7 +156,25 @@ BAND_INFO = {
     7: {"name": "swir_39um", "kind": "brightness_temp"},
     9: {"name": "wv_69um", "kind": "brightness_temp"},
     13: {"name": "ir_103um", "kind": "brightness_temp"},
+    # The supplementary IR bands (ml_constants.EXTRA_IR_BANDS). Absent
+    # until 0.159, so list_available_files rejected them with "band 11 not
+    # in supported set", fetch_frame_bands swallowed the ValueError, and
+    # EVERY frame -- mining and GUI alike -- fed neutral planes to the
+    # model's extra-IR channels. The multi-channel IR work of 0.98/0.99
+    # never reached a single training example or inference.
+    8: {"name": "wv_62um", "kind": "brightness_temp"},
+    10: {"name": "wv_73um", "kind": "brightness_temp"},
+    11: {"name": "ir_84um", "kind": "brightness_temp"},
+    12: {"name": "ir_96um", "kind": "brightness_temp"},
+    14: {"name": "ir_112um", "kind": "brightness_temp"},
+    15: {"name": "ir_123um", "kind": "brightness_temp"},
+    16: {"name": "ir_133um", "kind": "brightness_temp"},
 }
+
+# Extra-band outcomes across the process, so a silent all-neutral run
+# cannot happen again: mining prints this in its summary.
+EXTRA_BAND_STATS = {"requested": 0, "missing": {}, "last_error": {}}
+_EXTRA_BAND_LOCK = threading.Lock()
 
 
 def _get_s3_client():
@@ -554,7 +572,7 @@ def fixed_grid_to_latlon(ds):
 
 def fetch_extra_ir_bands(satellite, target_time, sector=None, bands=None,
                          limit=None, progress_callback=None,
-                         center_lat=None, center_lon=None) -> dict:
+                         center_lat=None, center_lon=None, anchor=None) -> dict:
     """Fetch the supplementary ABI IR bands used as extra model inputs.
 
     Returns {band_number: BandImage}, omitting any band that failed. A
@@ -590,6 +608,14 @@ def fetch_extra_ir_bands(satellite, target_time, sector=None, bands=None,
             # extra channels can come from mesoscale while band 13 came
             # from full disk, putting them on a different grid than the
             # frame they are meant to condition.
+            #
+            # That fallback made the SECTOR likely to agree, not the SCAN.
+            # With an anchor (0.160) the band comes from band 13's exact
+            # scan or not at all -- see get_band_image_matching.
+            if anchor is not None:
+                clat = center_lat if center_lat is not None else float(np.nanmean(anchor.lat))
+                clon = center_lon if center_lon is not None else float(np.nanmean(anchor.lon))
+                return b, get_band_image_matching(satellite, b, anchor, clat, clon)
             if center_lat is not None and center_lon is not None:
                 img = get_band_image_any_sector(satellite, b, target_time,
                                                 center_lat, center_lon, sector=sector)
@@ -617,7 +643,8 @@ def get_band_image_any_sector(satellite: str, band: int, target_time,
                               center_lat: float, center_lon: float,
                               sector: Optional[str] = None,
                               half_width_km: float = 512.0,
-                              progress_callback=None):
+                              progress_callback=None,
+                              sector_only: Optional[str] = None):
     """Fetch a band image covering (center_lat, center_lon), falling back
     from mesoscale to full disk.
 
@@ -640,13 +667,20 @@ def get_band_image_any_sector(satellite: str, band: int, target_time,
     target_time = _as_utc(target_time)
 
     # 1. Mesoscale, as before.
-    try:
-        img = get_band_image(satellite, band, target_time, sector=sector)
-        if img is not None and _image_covers(img, center_lat, center_lon):
-            return img
-    except Exception as e:
-        if progress_callback:
-            progress_callback(f"  RadM fetch failed ({type(e).__name__}); trying full disk.")
+    # sector_only (0.160): "F" = full disk only; "M1"/"M2" = that mesoscale
+    # sector only, no full-disk fallback. Used to pin every band of a frame
+    # to band 13's own scan -- see get_band_image_matching.
+    if sector_only != "F":
+        try:
+            img = get_band_image(satellite, band, target_time,
+                                 sector=sector_only if sector_only in ("M1", "M2") else sector)
+            if img is not None and _image_covers(img, center_lat, center_lon):
+                return img
+        except Exception as e:
+            if progress_callback:
+                progress_callback(f"  RadM fetch failed ({type(e).__name__}); trying full disk.")
+    if sector_only in ("M1", "M2"):
+        return None
 
     # 2. Full disk, cropped.
     #
@@ -680,7 +714,8 @@ def get_band_image_any_sector(satellite: str, band: int, target_time,
                                   prefer_ranged=True)
         try:
             out = gfg.read_cropped_radiance(h5, center_lat, center_lon, sat_lon,
-                                            half_width_km=half_width_km)
+                                            half_width_km=half_width_km,
+                                            prefetch=reader.prefetch)
         finally:
             h5.close()
         if out is None:
@@ -771,7 +806,13 @@ def get_glm_flashes(satellite: str, start_time, end_time, progress_callback=None
     start_time, end_time = _as_utc(start_time), _as_utc(end_time)
     bucket = BUCKETS.get(satellite)
     if bucket is None:
-        return np.array([]), np.array([]), np.array([])
+        # RAISE, don't return empty. An unrecognised name ("goes16" for
+        # "GOES-16") used to come back as zero flashes -- indistinguishable
+        # from a quiet scene, which is how the lightning channel stayed dead
+        # for two mining runs once before. The caller catches this and logs
+        # it, so a frame still generates; it just can't be silent.
+        raise ValueError(f"unknown satellite {satellite!r}; expected one of "
+                         f"{sorted(BUCKETS)}")
 
     client = _get_s3_client()
     keys = []
@@ -906,10 +947,45 @@ def fetch_bands_parallel(satellite: str, target_time, center_lat: float,
     return out
 
 
+# Two images are the same ABI scan when their start times agree to within
+# this. Bands of one scan share the timeline start; the next mesoscale scan
+# is >= 30 s later (60 s normally), so 10 s cannot confuse two scans.
+SAME_SCAN_TOLERANCE_S = 10.0
+
+
+def same_scan(img, anchor, tolerance_s: float = SAME_SCAN_TOLERANCE_S) -> bool:
+    if img is None or anchor is None:
+        return False
+    if (getattr(img, "mesoscale_sector", None) or "") != (getattr(anchor, "mesoscale_sector", None) or ""):
+        return False
+    return abs((_as_utc(img.scene_time) - _as_utc(anchor.scene_time)).total_seconds()) <= tolerance_s
+
+
+def get_band_image_matching(satellite: str, band: int, anchor, center_lat: float,
+                            center_lon: float, half_width_km: float = 512.0):
+    """Band `band` from EXACTLY the scan `anchor` came from -- same sector,
+    same scan start -- or None.
+
+    Each band used to choose mesoscale-or-full-disk on its own, so one
+    frame's bands could come from different scans. Found in 0.160: a
+    backfill asking for Beryl's bands at band 13's scan time got a
+    mesoscale scan for bands 11/10/15 while band 13 was a full-disk crop;
+    8.4 um vs 10.3 um correlation fell from 1.000 to 0.857. Mining did the
+    same independent choice per band -- consistent in the frames checked,
+    but one transient mesoscale failure away from a misregistered channel.
+    """
+    sec = getattr(anchor, "mesoscale_sector", None) or None
+    img = get_band_image_any_sector(
+        satellite, band, anchor.scene_time, center_lat, center_lon,
+        half_width_km=half_width_km,
+        sector_only="F" if sec in (None, "F") else sec)
+    return img if same_scan(img, anchor) else None
+
+
 def fetch_frame_bands(satellite: str, target_time, center_lat: float,
                       center_lon: float, base_bands=(13, 9, 7),
                       extra_limit: Optional[int] = None,
-                      sector=None, progress_callback=None):
+                      sector=None, progress_callback=None, anchor=None):
     """Fetch the base AND supplementary bands for one frame in ONE pool.
 
     These were two pools of three, run back to back: `fetch_bands_parallel`
@@ -929,13 +1005,23 @@ def fetch_frame_bands(satellite: str, target_time, center_lat: float,
                    if b not in base_bands]
     wanted = list(base_bands) + extra_bands
 
+    errors = {}
+
     def _one(b):
         try:
+            if anchor is not None:
+                # Pinned to the anchor's scan (0.160). A band that cannot
+                # come from that scan is missing, not borrowed from another.
+                img = get_band_image_matching(satellite, b, anchor, center_lat, center_lon)
+                if img is None:
+                    errors[b] = "not available from band 13's scan"
+                return b, img
             return b, get_band_image_any_sector(
                 satellite, b, target_time, center_lat, center_lon,
                 sector=sector,
                 progress_callback=progress_callback if b == 13 else None)
-        except Exception:
+        except Exception as e:
+            errors[b] = f"{type(e).__name__}: {e}"
             return b, None
 
     got = {}
@@ -945,4 +1031,15 @@ def fetch_frame_bands(satellite: str, target_time, center_lat: float,
 
     base = {b: got.get(b) for b in base_bands}
     extra = {b: got[b] for b in extra_bands if got.get(b) is not None}
+    missing = [b for b in extra_bands if got.get(b) is None]
+    with _EXTRA_BAND_LOCK:
+        EXTRA_BAND_STATS["requested"] += len(extra_bands)
+        for b in missing:
+            EXTRA_BAND_STATS["missing"][b] = EXTRA_BAND_STATS["missing"].get(b, 0) + 1
+            if b in errors:
+                EXTRA_BAND_STATS["last_error"][b] = errors[b]
+        first = sum(EXTRA_BAND_STATS["missing"].values()) <= 3 * max(1, len(extra_bands))
+    if missing and progress_callback and first:
+        progress_callback("  extra IR band(s) missing for this frame: " + ", ".join(
+            f"{b}" + (f" ({errors[b]})" if b in errors else "") for b in missing))
     return base, extra
